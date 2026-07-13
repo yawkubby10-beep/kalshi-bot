@@ -85,13 +85,16 @@ class KalshiClient:
 
     # ── Order Placement ────────────────────────────────────────────────────────
 
-    def place_market_order(self, ticker: str, side: str, count: int) -> Dict:
+    def place_market_order(self, ticker: str, side: str, count: int, price_cents: int = 99) -> Dict:
         """
         Place a market order on Kalshi V2.
         side = "yes" or "no"
         count = number of contracts (integer)
+        price_cents = max price willing to pay (99 = market taker)
         Endpoint: POST /portfolio/orders
+        Kalshi requires exactly one of yes_price or no_price
         """
+        price_key = "yes_price" if side == "yes" else "no_price"
         body = {
             "ticker": ticker,
             "client_order_id": f"arb_{int(time.time()*1000)}",
@@ -99,6 +102,7 @@ class KalshiClient:
             "action": "buy",
             "side": side,
             "count": count,
+            price_key: price_cents,
         }
         return self.post("/portfolio/orders", body)
 
