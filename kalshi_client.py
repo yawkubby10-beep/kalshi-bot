@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BASE_URL = "https://trading-api.kalshi.com"
+BASE_URL = "https://api.elections.kalshi.com"
 API_PATH = "/trade-api/v2"
 
 
