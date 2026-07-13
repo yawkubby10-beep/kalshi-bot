@@ -85,26 +85,28 @@ class KalshiClient:
 
     # ── Order Placement ────────────────────────────────────────────────────────
 
-    def place_market_order(self, ticker: str, side: str, count: int, price_cents: int = 99) -> Dict:
+    def place_market_order(self, ticker: str, side: str, count: int, price: float = 0.99) -> Dict:
         """
         Place a market order on Kalshi V2.
-        side = "yes" or "no"
-        count = number of contracts (integer)
-        price_cents = max price willing to pay (99 = market taker)
-        Endpoint: POST /portfolio/orders
-        Kalshi requires exactly one of yes_price or no_price
+        side = "yes" buys YES (bid), "no" buys NO (ask)
+        count = number of contracts (string)
+        price = price in dollars e.g. 0.50 for 50 cents
+        Endpoint: POST /trade-api/v2/portfolio/events/orders
         """
-        price_key = "yes_price" if side == "yes" else "no_price"
+        # Kalshi V2 uses bid/ask not yes/no
+        kalshi_side = "bid" if side == "yes" else "ask"
         body = {
             "ticker": ticker,
             "client_order_id": f"arb_{int(time.time()*1000)}",
             "type": "market",
             "action": "buy",
-            "side": side,
-            "count": count,
-            price_key: price_cents,
+            "side": kalshi_side,
+            "count": str(count),
+            "price": f"{price:.4f}",
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        return self.post("/portfolio/orders", body)
+        return self.post("/portfolio/events/orders", body)
 
     def place_limit_order(self, ticker: str, side: str, count: int, price_cents: int) -> Dict:
         """
