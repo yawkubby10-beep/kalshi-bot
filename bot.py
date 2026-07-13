@@ -496,7 +496,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-async def handle_pnl(update: Update):
+def handle_pnl():
     stats = analytics.summary()
     if not stats.get("trades"):
         text = "No closed trades yet."
@@ -517,7 +517,7 @@ async def handle_pnl(update: Update):
         )
     return text
 
-async def handle_by_crypto(update: Update):
+def handle_by_crypto():
     stats = analytics.summary()
     by = stats.get("by_crypto", {})
     if not by:
@@ -528,7 +528,7 @@ async def handle_by_crypto(update: Update):
         lines.append(f"{crypto}: {s['trades']}T {wr}%WR ${s['pnl']:+.2f}")
     return "\n".join(lines)
 
-async def handle_ev(update: Update):
+def handle_ev():
     stats    = analytics.summary()
     win_rate = stats.get("win_rate", 60) / 100 if stats.get("trades", 0) >= 5 else 0.60
     ev_t     = expected_value(0.50, STAKE, win_rate, False)
@@ -560,9 +560,9 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if q.data == "pnl":
-        await q.edit_message_text(await handle_pnl(update))
+        await q.edit_message_text(handle_pnl())
     elif q.data == "by_crypto":
-        await q.edit_message_text(await handle_by_crypto(update))
+        await q.edit_message_text(handle_by_crypto())
     elif q.data == "positions":
         active = [t for t in open_trades if t["status"] == "open"]
         if not active:
@@ -584,7 +584,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await q.edit_message_text(f"Balance error: {e}")
     elif q.data == "ev":
-        await q.edit_message_text(await handle_ev(update))
+        await q.edit_message_text(handle_ev())
     elif q.data == "settings":
         await q.edit_message_text(
             f"🔧 Settings\n"
@@ -610,8 +610,9 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("pnl", lambda u, c: u.message.reply_text(
-        asyncio.get_event_loop().run_until_complete(handle_pnl(u)))))
+    async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(handle_pnl())
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     async def on_startup(application):
