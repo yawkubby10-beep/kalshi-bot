@@ -33,7 +33,7 @@ class KalshiClient:
             msg,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=32  # digest length for SHA-256
+                salt_length=padding.PSS.MAX_LENGTH
             ),
             hashes.SHA256()
         )
