@@ -87,24 +87,20 @@ class KalshiClient:
 
     def place_market_order(self, ticker: str, side: str, count: int) -> Dict:
         """
-        Place a market order.
+        Place a market order on Kalshi V2.
         side = "yes" or "no"
         count = number of contracts (integer)
-        Uses V2 endpoint: POST /portfolio/events/orders
+        Endpoint: POST /portfolio/orders
         """
-        # For market orders, set price at taker worst case
-        # YES market order = willing to pay up to 99¢
-        # NO market order = willing to pay up to 99¢
         body = {
             "ticker": ticker,
             "client_order_id": f"arb_{int(time.time()*1000)}",
             "type": "market",
             "action": "buy",
             "side": side,
-            "count": str(count),
-            "time_in_force": "fill_or_kill",
+            "count": count,
         }
-        return self.post("/portfolio/events/orders", body)
+        return self.post("/portfolio/orders", body)
 
     def place_limit_order(self, ticker: str, side: str, count: int, price_cents: int) -> Dict:
         """
@@ -122,7 +118,7 @@ class KalshiClient:
             "yes_price" if side == "yes" else "no_price": price_str,
             "time_in_force": "good_till_canceled",
         }
-        return self.post("/portfolio/events/orders", body)
+        return self.post("/portfolio/orders", body)
 
     def get_positions(self) -> list:
         resp = self.get("/portfolio/positions", {"limit": 50})
