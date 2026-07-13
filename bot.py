@@ -167,8 +167,10 @@ async def place_trade(crypto: str, direction: str, market: Dict) -> Optional[Dic
         logger.info(f"[PAPER] Trade: {crypto} {direction} {side.upper()}@{entry_price}¢ x{STAKE}")
     else:
         try:
-            resp = client.place_market_order(ticker, side, STAKE)
-            trade["order_id"] = resp.get("order", {}).get("order_id", "")
+            # Use yes_ask price in dollars (market data gives cents, convert)
+            ask_dollars = entry_price / 100
+            resp = client.place_market_order(ticker, side, STAKE, price=ask_dollars)
+            trade["order_id"] = resp.get("order_id", resp.get("order", {}).get("order_id", ""))
             logger.info(f"[LIVE] Trade placed: {crypto} {direction} order_id={trade['order_id']}")
         except Exception as e:
             logger.error(f"Order failed: {e}")
