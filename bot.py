@@ -42,7 +42,13 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 KALSHI_API_KEY   = os.getenv("KALSHI_API_KEY", "")
-KALSHI_PRIV_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
+# Load private key from file or env var
+_key_file = os.getenv("KALSHI_PRIVATE_KEY_FILE", "")
+if _key_file and os.path.exists(_key_file):
+    with open(_key_file) as _f:
+        KALSHI_PRIV_KEY = _f.read()
+else:
+    KALSHI_PRIV_KEY = os.getenv("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER     = int(os.getenv("ALLOWED_USER_ID", "0"))
 PAPER_MODE       = os.getenv("PAPER_MODE", "true").lower() == "true"
