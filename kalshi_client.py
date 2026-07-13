@@ -1,30 +1,42 @@
 """
-Kalshi API Client
-RSA-PSS signed requests to Kalshi Trade API v2
+Kalshi API Client — RSA-PSS signed requests to Kalshi Trade API v2
+Base URL: https://trading-api.kalshi.com
+Auth: RSA-PSS SHA-256 with salt_length=digest_length (32 bytes)
+Sign: timestamp_ms + METHOD + path (path includes /trade-api/v2, excludes query string)
 """
 import time
 import base64
-import hashlib
 import requests
-import json
 from typing import Optional, Dict, Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+BASE_URL = "https://trading-api.kalshi.com"
+API_PATH = "/trade-api/v2"
 
 
 class KalshiClient:
     def __init__(self, api_key: str, private_key_pem: str):
         self.api_key = api_key
         self.private_key = serialization.load_pem_private_key(
-            private_key_pem.encode(), password=None
+            private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem,
+            password=None
         )
 
-    def _sign(self, method: str, path: str) -> tuple[str, str]:
+    def _sign(self, method: str, path: str) -> tuple:
+        """Sign: timestamp_ms + METHOD.upper() + path (no query string)."""
         ts = str(int(time.time() * 1000))
-        msg = ts + method.upper() + path
-        sig = self.private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
+        # Strip query string before signing
+        sign_path = path.split("?")[0]
+        msg = (ts + method.upper() + sign_path).encode()
+        sig = self.private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=32  # digest length for SHA-256
+            ),
+            hashes.SHA256()
+        )
         return ts, base64.b64encode(sig).decode()
 
     def _headers(self, method: str, path: str) -> Dict:
@@ -37,22 +49,19 @@ class KalshiClient:
         }
 
     def get(self, path: str, params: Dict = None) -> Dict:
-        full_path = path
+        full_path = API_PATH + path
+        url = BASE_URL + full_path
         if params:
-            qs = "&".join(f"{k}={v}" for k, v in params.items())
-            full_path = f"{path}?{qs}"
-        r = requests.get(
-            BASE_URL + full_path,
-            headers=self._headers("GET", full_path),
-            timeout=10
-        )
+            url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        r = requests.get(url, headers=self._headers("GET", full_path), timeout=10)
         r.raise_for_status()
         return r.json()
 
     def post(self, path: str, body: Dict) -> Dict:
+        full_path = API_PATH + path
         r = requests.post(
-            BASE_URL + path,
-            headers=self._headers("POST", path),
+            BASE_URL + full_path,
+            headers=self._headers("POST", full_path),
             json=body,
             timeout=10
         )
@@ -62,71 +71,63 @@ class KalshiClient:
     # ── Market Data ────────────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
-        """Return available balance in dollars."""
         resp = self.get("/portfolio/balance")
-        return float(resp.get("balance", "0")) / 100  # cents to dollars
+        return float(resp.get("balance", 0))
 
     def get_15m_markets(self, crypto: str = "BTC") -> list:
-        """Get active 15-min markets for a crypto."""
         series = f"KX{crypto}15M"
-        resp = self.get("/markets", {"limit": 5, "status": "open", "series_ticker": series})
+        resp = self.get("/markets", {"limit": 3, "status": "open", "series_ticker": series})
         return resp.get("markets", [])
 
-    def get_orderbook(self, ticker: str) -> Dict:
-        """Get orderbook for a market ticker."""
-        return self.get(f"/markets/{ticker}/orderbook")
-
     def get_market(self, ticker: str) -> Dict:
-        """Get single market details."""
         resp = self.get(f"/markets/{ticker}")
         return resp.get("market", {})
 
     # ── Order Placement ────────────────────────────────────────────────────────
 
-    def place_market_order(
-        self,
-        ticker: str,
-        side: str,        # "yes" or "no"
-        count: int,       # number of contracts
-        order_type: str = "market",
-    ) -> Dict:
-        """Place a market order. count = number of $1 contracts."""
+    def place_market_order(self, ticker: str, side: str, count: int) -> Dict:
+        """
+        Place a market order.
+        side = "yes" or "no"
+        count = number of contracts (integer)
+        Uses V2 endpoint: POST /portfolio/events/orders
+        """
+        # For market orders, set price at taker worst case
+        # YES market order = willing to pay up to 99¢
+        # NO market order = willing to pay up to 99¢
         body = {
             "ticker": ticker,
             "client_order_id": f"arb_{int(time.time()*1000)}",
-            "type": order_type,
+            "type": "market",
             "action": "buy",
             "side": side,
-            "count": count,
-            "buy_max_cost": count * 100,  # max cost in cents
+            "count": str(count),
+            "time_in_force": "fill_or_kill",
         }
-        return self.post("/portfolio/orders", body)
+        return self.post("/portfolio/events/orders", body)
 
-    def place_limit_order(
-        self,
-        ticker: str,
-        side: str,
-        count: int,
-        yes_price: int,   # cents (1-99)
-    ) -> Dict:
-        """Place a limit order at yes_price cents."""
+    def place_limit_order(self, ticker: str, side: str, count: int, price_cents: int) -> Dict:
+        """
+        Place a GTC limit order.
+        price_cents = price in cents (1-99)
+        """
+        price_str = f"{price_cents / 100:.4f}"
         body = {
             "ticker": ticker,
             "client_order_id": f"arb_{int(time.time()*1000)}",
             "type": "limit",
             "action": "buy",
             "side": side,
-            "count": count,
-            "yes_price": yes_price,
+            "count": str(count),
+            "yes_price" if side == "yes" else "no_price": price_str,
+            "time_in_force": "good_till_canceled",
         }
-        return self.post("/portfolio/orders", body)
+        return self.post("/portfolio/events/orders", body)
 
     def get_positions(self) -> list:
-        """Get current open positions."""
         resp = self.get("/portfolio/positions", {"limit": 50})
         return resp.get("market_positions", [])
 
     def get_fills(self, limit: int = 20) -> list:
-        """Get recent fills."""
         resp = self.get("/portfolio/fills", {"limit": limit})
         return resp.get("fills", [])
