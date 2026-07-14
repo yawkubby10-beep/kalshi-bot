@@ -125,7 +125,7 @@ class KalshiClient:
             "yes_price" if side == "yes" else "no_price": price_str,
             "time_in_force": "good_till_canceled",
         }
-        return self.post("/portfolio/orders", body)
+        return self.post("/portfolio/events/orders", body)
 
     def get_positions(self) -> list:
         resp = self.get("/portfolio/positions", {"limit": 50})
