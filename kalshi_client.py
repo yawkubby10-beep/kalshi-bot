@@ -104,7 +104,7 @@ class KalshiClient:
             "side": kalshi_side,
             "count": str(count),
             "price": f"{price:.4f}",
-            "time_in_force": "fill_or_kill",
+            "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
         }
         return self.post("/portfolio/events/orders", body)
