@@ -473,12 +473,15 @@ async def scan_loop(app: Application):
                     stats    = analytics.summary()
                     wr_str   = f"{stats['win_rate']}%" if stats.get("trades", 0) > 0 else "N/A"
 
-                    # Use actual fill data if available
-                    actual_c    = trade.get("actual_contracts", STAKE)
-                    actual_cost = trade.get("actual_cost", trade["stake_usd"])
-                    fill_note   = f"{actual_c:.0f}/{STAKE} filled" if actual_c < STAKE else f"{STAKE} filled"
-                    net_win     = round((0.99 * actual_c) - actual_cost - fee, 2)
-                    net_loss    = -actual_cost
+                    # Use actual fill data — for maker orders show pending stake
+                    actual_c    = trade.get("actual_contracts", 0)
+                    pending_c   = trade.get("pending_contracts", STAKE)
+                    total_c     = actual_c + pending_c
+                    display_stake = trade["stake_usd"]  # always show full intended stake
+                    fill_note   = f"{actual_c:.0f}/{total_c:.0f} filled ({pending_c:.0f} pending)" if pending_c > 0 else f"{actual_c:.0f}/{STAKE} filled"
+                    net_win     = round((0.99 * total_c) - display_stake - fee, 2)
+                    net_loss    = -display_stake
+                    actual_cost = display_stake
 
                     msg = (
                         f"{mode} | Momentum Arb v2\n"
