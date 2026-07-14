@@ -302,7 +302,12 @@ async def place_trade(crypto: str, direction: str, market: Dict, pct_change: flo
             else:
                 resp = client.place_market_order(ticker, side, STAKE, entry_price_d)
             trade["order_id"] = resp.get("order_id", "")
-            logger.info(f"[LIVE] {crypto} {direction} order_id={trade['order_id']}")
+            fill_count = float(resp.get("fill_count", 0) or 0)
+            avg_price  = float(resp.get("average_fill_price", 0) or 0)
+            remaining  = float(resp.get("remaining_count", 0) or 0)
+            trade["actual_contracts"] = fill_count
+            trade["actual_cost"] = round(avg_price * fill_count, 4)
+            logger.info(f"[LIVE] {crypto} {direction} order_id={trade['order_id']} filled={fill_count}/{STAKE} avg_price=${avg_price:.4f} remaining={remaining}")
         except Exception as e:
             import traceback
             logger.error(f"Order failed: {e}")
