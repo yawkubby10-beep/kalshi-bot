@@ -210,6 +210,42 @@ async def fetch_kalshi_market(session: aiohttp.ClientSession, crypto: str) -> Op
         logger.debug(f"Kalshi market fetch error {crypto}: {e}")
     return None
 
+async def fetch_orderbook_depth(session: aiohttp.ClientSession, ticker: str, side: str) -> int:
+    """
+    Check available contracts on the orderbook for a given side.
+    side = "yes" or "no"
+    Returns total available contracts at best price levels.
+    """
+    try:
+        async with session.get(
+            f"{BASE}/trade-api/v2/markets/{ticker}/orderbook",
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            data = await r.json()
+            book = data.get("orderbook", data)
+            
+            # Yes orders = bids, No orders = asks
+            # We are buying YES = we need sellers (asks on yes side)
+            # We are buying NO = we need sellers (asks on no side)
+            if side == "yes":
+                levels = book.get("yes", [])  # yes ask levels
+            else:
+                levels = book.get("no", [])   # no ask levels
+            
+            # Sum available contracts at best 3 price levels
+            total = 0
+            for i, level in enumerate(levels[:3]):
+                if isinstance(level, list) and len(level) >= 2:
+                    total += level[1]  # [price, quantity]
+                elif isinstance(level, dict):
+                    total += level.get("quantity", level.get("count", 0))
+            
+            logger.info(f"Orderbook {ticker} {side.upper()}: {total} contracts available")
+            return int(total)
+    except Exception as e:
+        logger.debug(f"Orderbook fetch error: {e}")
+        return 999  # if we can't check, proceed anyway
+
 # ── Signal Detection ───────────────────────────────────────────────────────────
 
 def signal_quality_score(pct_change: float, secs_remaining: int, yes_price: int) -> float:
@@ -377,6 +413,27 @@ async def scan_loop(app: Application):
                     f"Signal: {crypto} {direction} | {ticker} | "
                     f"entry={entry_price}¢ | score={score} | {secs_remaining:.0f}s"
                 )
+
+                # Check orderbook depth before trading
+                side = "yes" if direction == "UP" else "no"
+                available = await fetch_orderbook_depth(session, ticker, side)
+                if available < 1:
+                    logger.info(f"Skip {crypto}: no contracts available on orderbook ({available})")
+                    try:
+                        await app.bot.send_message(
+                            chat_id=ALLOWED_USER,
+                            text=f"⚠️ {crypto} {direction} signal skipped\n"
+                                 f"No contracts available on orderbook\n"
+                                 f"Market: {ticker}"
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # Adjust stake to available liquidity
+                actual_stake = min(STAKE, available)
+                if actual_stake < STAKE:
+                    logger.info(f"{crypto}: only {available} contracts available, reducing stake from {STAKE} to {actual_stake}")
 
                 trade = await place_trade(crypto, direction, market, pct_change, score)
                 if trade:
