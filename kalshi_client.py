@@ -6,6 +6,7 @@ Sign: timestamp_ms + METHOD + path (path includes /trade-api/v2, excludes query 
 """
 import time
 import base64
+import uuid
 import requests
 from typing import Optional, Dict, Any
 from cryptography.hazmat.primitives import hashes, serialization
@@ -97,7 +98,7 @@ class KalshiClient:
         kalshi_side = "bid" if side == "yes" else "ask"
         body = {
             "ticker": ticker,
-            "client_order_id": f"arb_{int(time.time()*1000)}",
+            "client_order_id": str(uuid.uuid4())[:16],
             "type": "market",
             "action": "buy",
             "side": kalshi_side,
@@ -116,7 +117,7 @@ class KalshiClient:
         price_str = f"{price_cents / 100:.4f}"
         body = {
             "ticker": ticker,
-            "client_order_id": f"arb_{int(time.time()*1000)}",
+            "client_order_id": str(uuid.uuid4())[:16],
             "type": "limit",
             "action": "buy",
             "side": side,
