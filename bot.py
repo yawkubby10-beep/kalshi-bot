@@ -52,7 +52,9 @@ MIN_FILL         = int(os.getenv("MIN_FILL_CONTRACTS", "2"))  # skip if fewer co
 SCAN_INTERVAL    = 10
 
 CRYPTOS = ["BTC", "ETH", "SOL"]
-SERIES  = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M"}
+SERIES_15M = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M"}
+SERIES_1H  = {"BTC": "KXBTC1H",  "ETH": "KXETH1H",  "SOL": "KXSOL1H"}
+SERIES     = SERIES_15M  # kept for compatibility
 BASE    = "https://api.elections.kalshi.com"
 
 # ── Fee Calculator ─────────────────────────────────────────────────────────────
@@ -195,20 +197,56 @@ async def fetch_kucoin_prices(session: aiohttp.ClientSession) -> Dict[str, float
         logger.warning(f"KuCoin fetch error: {e}")
         return {}
 
-async def fetch_kalshi_market(session: aiohttp.ClientSession, crypto: str) -> Optional[Dict]:
+async def fetch_kalshi_market(session: aiohttp.ClientSession, crypto: str, series: str = None) -> Optional[Dict]:
     try:
-        series = SERIES[crypto]
+        s = series or SERIES_15M[crypto]
         async with session.get(
             f"{BASE}/trade-api/v2/markets",
-            params={"limit": 3, "status": "open", "series_ticker": series},
+            params={"limit": 3, "status": "open", "series_ticker": s},
             timeout=aiohttp.ClientTimeout(total=5)
         ) as r:
             data = await r.json()
             markets = data.get("markets", [])
             if markets:
-                return markets[0]
+                m = markets[0]
+                m["_series"] = s
+                return m
     except Exception as e:
-        logger.debug(f"Kalshi market fetch error {crypto}: {e}")
+        logger.debug(f"Kalshi market fetch error {crypto} {series}: {e}")
+    return None
+
+async def fetch_best_market(session: aiohttp.ClientSession, crypto: str) -> Optional[Dict]:
+    """
+    Smart market selection:
+    1. Try hourly market first (deeper liquidity, taker fills)
+    2. Fall back to 15-min market (maker limit order)
+    Returns market dict with _order_type set to "taker" or "maker"
+    """
+    # Try 1H first
+    market_1h = await fetch_kalshi_market(session, crypto, SERIES_1H[crypto])
+    if market_1h:
+        # Check if 1H has reasonable time left (>10 min)
+        close_time = market_1h.get("close_time", "")
+        secs_remaining = 3600
+        if close_time:
+            try:
+                close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                secs_remaining = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
+            except Exception:
+                pass
+        if secs_remaining > 600:  # >10 min left on hourly
+            market_1h["_order_type"] = "taker"
+            market_1h["_secs_remaining"] = secs_remaining
+            logger.info(f"{crypto}: using 1H market {market_1h.get('ticker')} ({secs_remaining:.0f}s) — TAKER")
+            return market_1h
+
+    # Fall back to 15M with maker
+    market_15m = await fetch_kalshi_market(session, crypto, SERIES_15M[crypto])
+    if market_15m:
+        market_15m["_order_type"] = "maker"
+        logger.info(f"{crypto}: using 15M market {market_15m.get('ticker')} — MAKER limit order")
+        return market_15m
+
     return None
 
 async def fetch_orderbook_depth(session: aiohttp.ClientSession, ticker: str, side: str) -> int:
@@ -332,21 +370,28 @@ async def place_trade(crypto: str, direction: str, market: Dict, pct_change: flo
         logger.info(f"[PAPER] {crypto} {direction} {side.upper()}@{entry_price_c}¢ ×{STAKE} fee=${fee:.4f} EV=${ev_data['ev']:.3f}")
     else:
         try:
-            # MAKER: limit order 2¢ below ask — we post ON the book
-            limit_price_c = max(1, entry_price_c - 2)
-            limit_price_d = limit_price_c / 100
-            resp = client.place_limit_order(ticker, side, STAKE, limit_price_d)
-            trade["order_id"]      = resp.get("order_id", "")
-            trade["entry_price"]   = limit_price_c
-            trade["stake_usd"]     = round(limit_price_d * STAKE, 2)
-            trade["limit_price"]   = limit_price_c
+            order_type = market.get("_order_type", "maker") if market else "maker"
+            if order_type == "taker":
+                # TAKER: instant market order on liquid hourly market
+                resp = client.place_market_order(ticker, side, STAKE, entry_price_d)
+                trade["order_type"] = "taker"
+            else:
+                # MAKER: limit order 2¢ below ask on thin 15M market
+                limit_price_c = max(1, entry_price_c - 2)
+                limit_price_d = limit_price_c / 100
+                resp = client.place_limit_order(ticker, side, STAKE, limit_price_d)
+                trade["entry_price"] = limit_price_c
+                trade["stake_usd"]   = round(limit_price_d * STAKE, 2)
+                trade["limit_price"] = limit_price_c
+                trade["order_type"]  = "maker"
+            trade["order_id"]          = resp.get("order_id", "")
             fill_count = float(resp.get("fill_count", 0) or 0)
-            avg_price  = float(resp.get("average_fill_price", limit_price_d) or limit_price_d)
+            avg_price  = float(resp.get("average_fill_price", entry_price_d) or entry_price_d)
             remaining  = float(resp.get("remaining_count", STAKE) or STAKE)
             trade["actual_contracts"]  = fill_count
             trade["actual_cost"]       = round(avg_price * fill_count, 4)
             trade["pending_contracts"] = remaining
-            logger.info(f"[LIVE MAKER] {crypto} {direction} order_id={trade['order_id']} limit={limit_price_c}¢ filled={fill_count} pending={remaining}")
+            logger.info(f"[LIVE {order_type.upper()}] {crypto} {direction} order_id={trade['order_id']} filled={fill_count} pending={remaining}")
         except Exception as e:
             import traceback
             logger.error(f"Order failed: {e}")
@@ -387,7 +432,7 @@ async def scan_loop(app: Application):
                     logger.info(f"Already in {crypto} trade, skipping")
                     continue
 
-                market = await fetch_kalshi_market(session, crypto)
+                market = await fetch_best_market(session, crypto)
                 if not market:
                     logger.warning(f"No Kalshi market found for {crypto}")
                     continue
@@ -397,8 +442,8 @@ async def scan_loop(app: Application):
                 no_price  = market.get("no_ask", 50)
                 close_time = market.get("close_time", "")
 
-                secs_remaining = 900
-                if close_time:
+                secs_remaining = market.get("_secs_remaining", 900)
+                if not market.get("_secs_remaining") and close_time:
                     try:
                         close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
                         secs_remaining = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
@@ -422,7 +467,7 @@ async def scan_loop(app: Application):
                 trade = await place_trade(crypto, direction, market, pct_change, score)
                 if trade:
                     mode     = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
-                    order_t  = "📊 LIMIT (maker)" if USE_LIMIT_ORDERS else "⚡ MARKET (taker)"
+                    order_t  = "📊 LIMIT maker" if trade.get("order_type") == "maker" else "⚡ MARKET taker"
                     fee      = trade["fee"]
                     ev       = trade["ev"]
                     stats    = analytics.summary()
