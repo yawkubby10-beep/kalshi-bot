@@ -431,9 +431,32 @@ async def resolver_loop(app: Application):
                     won = (trade["side"] == "yes" and result == "yes") or \
                           (trade["side"] == "no" and result == "no")
 
-                    gross_pnl = (0.99 - trade["entry_price"]/100) * trade["contracts"] if won \
-                                else -trade["stake_usd"]
-                    net_pnl   = round(gross_pnl - trade["fee"], 2) if won else round(gross_pnl, 2)
+                    # Try to get actual fill data from Kalshi
+                    actual_contracts = trade["contracts"]
+                    actual_cost = trade["stake_usd"]
+                    if trade.get("order_id") and not PAPER_MODE:
+                        try:
+                            ord_path = f"/trade-api/v2/portfolio/orders/{trade['order_id']}"
+                            async with session.get(
+                                f"{BASE}{ord_path}",
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            ) as ord_r:
+                                ord_data = await ord_r.json()
+                                order = ord_data.get("order", ord_data)
+                                fill_count = float(order.get("fill_count", trade["contracts"]) or trade["contracts"])
+                                avg_price  = float(order.get("average_fill_price", trade["entry_price"]/100) or trade["entry_price"]/100)
+                                actual_contracts = fill_count
+                                actual_cost = round(avg_price * fill_count, 4)
+                        except Exception as ex:
+                            logger.debug(f"Could not fetch order details: {ex}")
+
+                    gross_pnl = round((0.99 - actual_cost/actual_contracts) * actual_contracts, 4) if won and actual_contracts > 0 \
+                                else -actual_cost
+                    actual_fee = round(0.07 * (actual_cost/actual_contracts if actual_contracts > 0 else 0.5) * \
+                                (1 - actual_cost/actual_contracts if actual_contracts > 0 else 0.5) * actual_contracts, 4)
+                    net_pnl = round(gross_pnl - actual_fee, 2) if won else round(gross_pnl, 2)
+                    trade["actual_contracts"] = actual_contracts
+                    trade["actual_cost"] = actual_cost
 
                     trade["status"]    = "closed"
                     trade["pnl"]       = net_pnl
