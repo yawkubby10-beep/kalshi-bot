@@ -48,6 +48,7 @@ STAKE            = int(os.getenv("STAKE_CONTRACTS", "5"))
 THRESHOLD        = float(os.getenv("MOMENTUM_THRESHOLD", "0.0008"))
 USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "false").lower() == "true"
 MIN_SECS_LEFT    = int(os.getenv("MIN_SECS_LEFT", "120"))
+MIN_FILL         = int(os.getenv("MIN_FILL_CONTRACTS", "2"))  # skip if fewer contracts available
 SCAN_INTERVAL    = 10
 
 CRYPTOS = ["BTC", "ETH", "SOL"]
@@ -417,25 +418,23 @@ async def scan_loop(app: Application):
                 # Check orderbook depth before trading
                 side = "yes" if direction == "UP" else "no"
                 available = await fetch_orderbook_depth(session, ticker, side)
-                if available < 1:
-                    logger.info(f"Skip {crypto}: no contracts available on orderbook ({available})")
-                    try:
-                        await app.bot.send_message(
-                            chat_id=ALLOWED_USER,
-                            text=f"⚠️ {crypto} {direction} signal skipped\n"
-                                 f"No contracts available on orderbook\n"
-                                 f"Market: {ticker}"
-                        )
-                    except Exception:
-                        pass
-                    continue
 
-                # Adjust stake to available liquidity
-                actual_stake = min(STAKE, available)
-                if actual_stake < STAKE:
-                    logger.info(f"{crypto}: only {available} contracts available, reducing stake from {STAKE} to {actual_stake}")
+                if available < MIN_FILL:
+                    logger.info(f"Skip {crypto}: only {available} contracts available (min={MIN_FILL}), no trade")
+                    continue  # silently skip — no Telegram noise
+
+                # Cap stake to what's actually available
+                effective_stake = min(STAKE, available)
+                if effective_stake < STAKE:
+                    logger.info(f"{crypto}: capping stake to {effective_stake} (available={available})")
+
+                # Temporarily override STAKE for this trade
+                original_stake = STAKE
+                import builtins
+                globals()['STAKE'] = effective_stake
 
                 trade = await place_trade(crypto, direction, market, pct_change, score)
+                globals()['STAKE'] = original_stake  # restore
                 if trade:
                     mode     = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
                     order_t  = "📊 LIMIT (maker)" if USE_LIMIT_ORDERS else "⚡ MARKET (taker)"
