@@ -125,7 +125,7 @@ class KalshiClient:
             "count": str(count),
             "price": f"{price:.4f}",
             "time_in_force": "good_till_canceled",
-            "self_trade_prevention_type": "cancel_newest",
+            "self_trade_prevention_type": "maker",
         }
         return self.post("/portfolio/events/orders", body)
 
