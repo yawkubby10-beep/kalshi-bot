@@ -109,21 +109,23 @@ class KalshiClient:
         }
         return self.post("/portfolio/events/orders", body)
 
-    def place_limit_order(self, ticker: str, side: str, count: int, price_cents: int) -> Dict:
+    def place_limit_order(self, ticker: str, side: str, count: int, price: float) -> Dict:
         """
         Place a GTC limit order.
-        price_cents = price in cents (1-99)
+        side = "yes" or "no"
+        price = price in dollars e.g. 0.48
         """
-        price_str = f"{price_cents / 100:.4f}"
+        kalshi_side = "bid" if side == "yes" else "ask"
         body = {
             "ticker": ticker,
             "client_order_id": str(uuid.uuid4())[:16],
             "type": "limit",
             "action": "buy",
-            "side": side,
+            "side": kalshi_side,
             "count": str(count),
-            "yes_price" if side == "yes" else "no_price": price_str,
+            "price": f"{price:.4f}",
             "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "cancel_newest",
         }
         return self.post("/portfolio/events/orders", body)
 
