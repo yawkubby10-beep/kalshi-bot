@@ -46,7 +46,7 @@ ALLOWED_USER     = int(os.getenv("ALLOWED_USER_ID", "0"))
 PAPER_MODE       = os.getenv("PAPER_MODE", "true").lower() == "true"
 STAKE            = int(os.getenv("STAKE_CONTRACTS", "5"))
 THRESHOLD        = float(os.getenv("MOMENTUM_THRESHOLD", "0.0008"))
-USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "false").lower() == "true"
+USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
 MIN_SECS_LEFT    = int(os.getenv("MIN_SECS_LEFT", "120"))
 MIN_FILL         = int(os.getenv("MIN_FILL_CONTRACTS", "2"))  # skip if fewer contracts available
 SCAN_INTERVAL    = 10
@@ -332,19 +332,21 @@ async def place_trade(crypto: str, direction: str, market: Dict, pct_change: flo
         logger.info(f"[PAPER] {crypto} {direction} {side.upper()}@{entry_price_c}¢ ×{STAKE} fee=${fee:.4f} EV=${ev_data['ev']:.3f}")
     else:
         try:
-            if USE_LIMIT_ORDERS:
-                # Place limit order 1 tick below ask (maker)
-                limit_price = max(1, entry_price_c - 1) / 100
-                resp = client.place_limit_order(ticker, side, STAKE, limit_price)
-            else:
-                resp = client.place_market_order(ticker, side, STAKE, entry_price_d)
-            trade["order_id"] = resp.get("order_id", "")
+            # MAKER: limit order 2¢ below ask — we post ON the book
+            limit_price_c = max(1, entry_price_c - 2)
+            limit_price_d = limit_price_c / 100
+            resp = client.place_limit_order(ticker, side, STAKE, limit_price_d)
+            trade["order_id"]      = resp.get("order_id", "")
+            trade["entry_price"]   = limit_price_c
+            trade["stake_usd"]     = round(limit_price_d * STAKE, 2)
+            trade["limit_price"]   = limit_price_c
             fill_count = float(resp.get("fill_count", 0) or 0)
-            avg_price  = float(resp.get("average_fill_price", 0) or 0)
-            remaining  = float(resp.get("remaining_count", 0) or 0)
-            trade["actual_contracts"] = fill_count
-            trade["actual_cost"] = round(avg_price * fill_count, 4)
-            logger.info(f"[LIVE] {crypto} {direction} order_id={trade['order_id']} filled={fill_count}/{STAKE} avg_price=${avg_price:.4f} remaining={remaining}")
+            avg_price  = float(resp.get("average_fill_price", limit_price_d) or limit_price_d)
+            remaining  = float(resp.get("remaining_count", STAKE) or STAKE)
+            trade["actual_contracts"]  = fill_count
+            trade["actual_cost"]       = round(avg_price * fill_count, 4)
+            trade["pending_contracts"] = remaining
+            logger.info(f"[LIVE MAKER] {crypto} {direction} order_id={trade['order_id']} limit={limit_price_c}¢ filled={fill_count} pending={remaining}")
         except Exception as e:
             import traceback
             logger.error(f"Order failed: {e}")
@@ -415,26 +417,9 @@ async def scan_loop(app: Application):
                     f"entry={entry_price}¢ | score={score} | {secs_remaining:.0f}s"
                 )
 
-                # Check orderbook depth before trading
-                side = "yes" if direction == "UP" else "no"
-                available = await fetch_orderbook_depth(session, ticker, side)
-
-                if available < MIN_FILL:
-                    logger.info(f"Skip {crypto}: only {available} contracts available (min={MIN_FILL}), no trade")
-                    continue  # silently skip — no Telegram noise
-
-                # Cap stake to what's actually available
-                effective_stake = min(STAKE, available)
-                if effective_stake < STAKE:
-                    logger.info(f"{crypto}: capping stake to {effective_stake} (available={available})")
-
-                # Temporarily override STAKE for this trade
-                original_stake = STAKE
-                import builtins
-                globals()['STAKE'] = effective_stake
+                # MAKER: post limit order on book — no orderbook needed
 
                 trade = await place_trade(crypto, direction, market, pct_change, score)
-                globals()['STAKE'] = original_stake  # restore
                 if trade:
                     mode     = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
                     order_t  = "📊 LIMIT (maker)" if USE_LIMIT_ORDERS else "⚡ MARKET (taker)"
@@ -490,6 +475,17 @@ async def resolver_loop(app: Application):
                     data   = await r.json()
                     market = data.get("market", {})
                     status = market.get("status", "")
+
+                # Cancel pending limit orders if market is closing
+                if status in ("closed", "finalized") and trade.get("pending_contracts", 0) > 0 and trade.get("order_id") and not PAPER_MODE:
+                    try:
+                        async with session.delete(
+                            f"{BASE}/trade-api/v2/portfolio/orders/{trade['order_id']}",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as cr:
+                            logger.info(f"Cancelled pending limit order: {cr.status}")
+                    except Exception as ce:
+                        logger.debug(f"Cancel error: {ce}")
 
                 if status == "finalized":
                     result = market.get("result", "")
