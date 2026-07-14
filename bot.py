@@ -1,785 +1,819 @@
 """
-Kalshi Momentum Arbitrage Bot v2
-==================================
-Upgraded features:
-- Accurate fee simulation (taker + maker)
-- Win rate tracking with confidence intervals
-- Signal quality scoring
-- Minimum time remaining filter (>120s)
-- Expected value per trade calculation
-- Limit order maker strategy option
-- Full P&L analytics with Sharpe ratio
-- Auto stake sizing based on Kelly criterion
+Kalshi Bot v3 — Convergence + Lag engine for BTC/ETH/SOL short-horizon markets
+==============================================================================
+Why v2 lost money live (fixed here):
+
+ 1. ORDER SEMANTICS BUG — the V2 endpoint quotes everything on the YES leg.
+    v2 sent NO orders with the NO price on the YES leg, so every DOWN trade
+    either crossed the book instantly at a terrible price or rested at a
+    nonsense level. Fixed in kalshi_client.py.
+ 2. UNAUTHENTICATED CANCELS — resolver DELETEs had no signature → 401 → stale
+    resting orders sat in the book and got picked off. Cancels now signed,
+    and resting orders carry a server-side expiration so they die on their own.
+ 3. WRONG-SIDE DEPTH — v2 read book["yes"] as YES ask liquidity. Both book
+    arrays are BIDS; asks must be derived from the opposite side. Fixed.
+ 4. FANTASY PAPER FILLS — v2 assumed 100% fills at the quoted price. v3 paper
+    mode walks the real book for takers and only fills makers when real trades
+    print through our price. Paper now predicts live.
+ 5. MOMENTUM CHASING — buying after the move at prices market makers already
+    updated is structurally -EV. v3 only ever trades when its own fair-value
+    model says the AVAILABLE price is mispriced net of fees.
+
+Strategies:
+  CONVERGENCE (fill workhorse): in the final minutes of 15M *and* 1H markets
+    (1H traded only inside its last minutes → 1H liquidity, 15-min exposure),
+    buy the heavy favorite when model p exceeds ask + fee + edge. If the ask
+    is too rich, post a self-expiring post-only bid at our price instead.
+  LAG (opportunist): on a vol-normalized spot burst, take liquidity only if
+    the book still lags fair value by a large margin net of taker fees.
 """
 
 import asyncio
 import logging
+import math
 import os
 import time
-import math
-from collections import defaultdict
+import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional
 
 import aiohttp
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ContextTypes)
+
+import engine
+from engine import (MarketMeta, PaperBroker, RiskManager, SpotFeed, Store,
+                    depth_at, in_blackout, maker_fee, maker_fee_pc,
+                    parse_blackouts, parse_book, parse_market, taker_fee,
+                    taker_fee_pc, walk_book)
+from kalshi_client import KalshiClient
 
 load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+    level=logging.INFO)
+logger = logging.getLogger("bot")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-KALSHI_API_KEY   = os.getenv("KALSHI_API_KEY", "")
-KALSHI_PRIV_KEY  = os.getenv("KALSHI_PRIVATE_KEY", "")
-_key_file = os.getenv("KALSHI_PRIVATE_KEY_FILE", "")
-if _key_file and os.path.exists(_key_file):
-    with open(_key_file) as _f:
-        KALSHI_PRIV_KEY = _f.read()
+# ── Config ──────────────────────────────────────────────────────────────────
+KALSHI_API_KEY = os.getenv("KALSHI_API_KEY", "")
+KALSHI_PRIV_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
+_kf = os.getenv("KALSHI_PRIVATE_KEY_FILE", "")
+if _kf and os.path.exists(_kf):
+    KALSHI_PRIV_KEY = open(_kf).read()
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_USER     = int(os.getenv("ALLOWED_USER_ID", "0"))
-PAPER_MODE       = os.getenv("PAPER_MODE", "true").lower() == "true"
-STAKE            = int(os.getenv("STAKE_CONTRACTS", "5"))
-THRESHOLD        = float(os.getenv("MOMENTUM_THRESHOLD", "0.0008"))
-USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
-MIN_SECS_LEFT    = int(os.getenv("MIN_SECS_LEFT", "120"))
-MIN_FILL         = int(os.getenv("MIN_FILL_CONTRACTS", "2"))  # skip if fewer contracts available
-SCAN_INTERVAL    = 10
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ALLOWED_USER = int(os.getenv("ALLOWED_USER_ID", "0"))
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+MODE = "paper" if PAPER_MODE else "live"
 
-CRYPTOS = ["BTC", "ETH", "SOL"]
-SERIES_15M = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M"}
-SERIES_1H  = {"BTC": "KXBTC1H",  "ETH": "KXETH1H",  "SOL": "KXSOL1H"}
-SERIES     = SERIES_15M  # kept for compatibility
-BASE    = "https://api.elections.kalshi.com"
+CRYPTOS = [c.strip().upper() for c in
+           os.getenv("CRYPTOS", "BTC,ETH,SOL").split(",") if c.strip()]
+SERIES_15M = {c: f"KX{c}15M" for c in CRYPTOS}
+SERIES_1H = {c: f"KX{c}1H" for c in CRYPTOS}
+BASE = "https://api.elections.kalshi.com"
 
-# ── Fee Calculator ─────────────────────────────────────────────────────────────
+# Sizing / risk
+MAX_CONTRACTS = int(os.getenv("STAKE_MAX_CONTRACTS",
+                              os.getenv("STAKE_CONTRACTS", "10")))
+MAX_STAKE_USD = float(os.getenv("MAX_STAKE_USD", "9"))
+MIN_FILL = int(os.getenv("MIN_FILL_CONTRACTS", "2"))
+DEPTH_FRACTION = float(os.getenv("DEPTH_FRACTION", "0.30"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
+PER_CRYPTO = int(os.getenv("PER_CRYPTO_MAX", "1"))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USD", "15"))
 
-def kalshi_taker_fee(price_dollars: float, contracts: int) -> float:
-    """Calculate Kalshi taker fee: 0.07 × p × (1-p) per contract."""
-    fee_per = round(0.07 * price_dollars * (1 - price_dollars), 4)
-    return round(fee_per * contracts, 4)
+# Model
+TAIL_MULT = float(os.getenv("TAIL_MULT", "1.25"))
+SPIKE_MAX = float(os.getenv("SPIKE_MAX", "2.5"))
+BLACKOUTS = parse_blackouts(os.getenv(
+    "NEWS_BLACKOUT_UTC", "12:25-12:45,13:55-14:15,18:00-18:20"))
 
-def kalshi_maker_fee(price_dollars: float, contracts: int) -> float:
-    """Maker fee is ~25% of taker fee."""
-    return round(kalshi_taker_fee(price_dollars, contracts) * 0.25, 4)
+# Convergence strategy
+CONV_MIN_P = float(os.getenv("CONV_MIN_P", "0.965"))
+CONV_MIN_EV = float(os.getenv("CONV_MIN_EV", "0.015"))
+CONV_MIN_TAU = float(os.getenv("CONV_MIN_TAU", "45"))
+CONV_MAX_TAU = float(os.getenv("CONV_MAX_TAU", "300"))
+CONV_PRICE_MIN = int(os.getenv("CONV_PRICE_MIN", "78"))
+CONV_PRICE_MAX = int(os.getenv("CONV_PRICE_MAX", "97"))
+CONV_MAKER = os.getenv("CONV_MAKER", "true").lower() == "true"
+MAKER_TTL = float(os.getenv("MAKER_TTL_S", "20"))
 
-def expected_value(entry_price: float, contracts: int, win_rate: float, use_maker: bool = False) -> dict:
-    """Calculate expected value per trade."""
-    fee = kalshi_maker_fee(entry_price, contracts) if use_maker else kalshi_taker_fee(entry_price, contracts)
-    win_payout = 0.99 * contracts
-    stake      = entry_price * contracts
-    net_win    = win_payout - stake - fee
-    net_loss   = -(stake + fee)  # fee paid even on loss? No — Kalshi charges on entry only
-    net_loss   = -stake  # stake lost, fee already paid at entry
+# Lag strategy
+LAG_ENABLED = os.getenv("LAG_ENABLED", "true").lower() == "true"
+LAG_Z = float(os.getenv("LAG_Z", "3.0"))
+LAG_LOOKBACK = float(os.getenv("LAG_LOOKBACK_S", "8"))
+LAG_MIN_MOVE = float(os.getenv("LAG_MIN_MOVE", "0.0008"))
+LAG_MIN_EV = float(os.getenv("LAG_MIN_EV", "0.04"))
+LAG_MIN_TAU = float(os.getenv("LAG_MIN_TAU", "90"))
+LAG_MAX_TAU = float(os.getenv("LAG_MAX_TAU", "900"))
+LAG_COOLDOWN = float(os.getenv("LAG_COOLDOWN_S", "60"))
 
-    ev = win_rate * net_win + (1 - win_rate) * net_loss
-    breakeven_wr = stake / (stake + net_win) if net_win > 0 else 1.0
+# Exits
+STOP_P = float(os.getenv("STOP_P", "0.30"))
+STOP_MIN_TAU = float(os.getenv("STOP_MIN_TAU", "35"))
 
-    return {
-        "stake": round(stake, 4),
-        "fee": round(fee, 4),
-        "net_win": round(net_win, 4),
-        "net_loss": round(net_loss, 4),
-        "ev": round(ev, 4),
-        "breakeven_wr": round(breakeven_wr * 100, 1),
-        "roi_if_win": round(net_win / stake * 100, 1),
-    }
+DB_PATH = os.getenv("DB_PATH", "kalshi_v3.db")
 
-def kelly_contracts(win_rate: float, entry_price: float, bankroll: float, max_contracts: int = 10) -> int:
-    """Kelly criterion for optimal contract sizing."""
-    payout_ratio = (0.99 - entry_price) / entry_price  # net odds
-    kelly_fraction = (win_rate * (1 + payout_ratio) - 1) / payout_ratio
-    kelly_fraction = max(0, min(kelly_fraction, 0.25))  # cap at 25% bankroll
-    optimal_stake  = bankroll * kelly_fraction
-    contracts      = int(optimal_stake / entry_price)
-    return max(1, min(contracts, max_contracts))
+# ── Globals ─────────────────────────────────────────────────────────────────
+store = Store(DB_PATH)
+risk = RiskManager(store, MODE, MAX_DAILY_LOSS, MAX_CONCURRENT, PER_CRYPTO)
+spot = SpotFeed(CRYPTOS)
+client: Optional[KalshiClient] = None
+if not PAPER_MODE:
+    client = KalshiClient(KALSHI_API_KEY, KALSHI_PRIV_KEY)
 
-# ── Analytics ──────────────────────────────────────────────────────────────────
+http: Optional[aiohttp.ClientSession] = None
+paper = PaperBroker(lambda: http)
 
-class Analytics:
-    def __init__(self):
-        self.trades: List[Dict] = []
-        self.paper_bankroll = 100.0  # starting paper bankroll
+market_cache: Dict[str, List[MarketMeta]] = {c: [] for c in CRYPTOS}
+open_positions: List[dict] = []
+pending_makers: Dict[str, dict] = {}      # key → intent
+consumed_fill_ids: set = set()
+lag_cooldown: Dict[str, float] = {c: 0.0 for c in CRYPTOS}
+_book_cache: Dict[str, tuple] = {}
+tg_app: Optional[Application] = None
 
-    def add_trade(self, trade: Dict):
-        self.trades.append(trade)
 
-    def summary(self) -> Dict:
-        closed = [t for t in self.trades if t.get("status") == "closed"]
-        if not closed:
-            return {"trades": 0}
+async def notify(text: str):
+    if tg_app and ALLOWED_USER:
+        try:
+            await tg_app.bot.send_message(chat_id=ALLOWED_USER, text=text)
+        except Exception as e:
+            logger.warning(f"telegram error: {e}")
 
-        total_trades = len(closed)
-        wins = [t for t in closed if t.get("won")]
-        losses = [t for t in closed if not t.get("won")]
-        win_rate = len(wins) / total_trades
 
-        total_pnl    = sum(t.get("pnl", 0) for t in closed)
-        total_fees   = sum(t.get("fee", 0) for t in closed)
-        total_staked = sum(t.get("stake_usd", 0) for t in closed)
-        roi          = total_pnl / total_staked * 100 if total_staked > 0 else 0
+# ── Data helpers ────────────────────────────────────────────────────────────
+async def fetch_json(path: str, params: dict = None) -> dict:
+    async with http.get(f"{BASE}{path}", params=params,
+                        timeout=aiohttp.ClientTimeout(total=6)) as r:
+        return await r.json()
 
-        # Sharpe-like ratio
-        pnls = [t.get("pnl", 0) for t in closed]
-        avg_pnl = sum(pnls) / len(pnls)
-        if len(pnls) > 1:
-            std_pnl = math.sqrt(sum((p - avg_pnl)**2 for p in pnls) / (len(pnls)-1))
-            sharpe = avg_pnl / std_pnl if std_pnl > 0 else 0
-        else:
-            sharpe = 0
 
-        # Win rate confidence interval (Wilson interval)
-        n, p = total_trades, win_rate
-        z = 1.96  # 95% CI
-        ci_half = z * math.sqrt(p*(1-p)/n + z**2/(4*n**2)) / (1 + z**2/n)
-        ci_lo = (p + z**2/(2*n) - ci_half) / (1 + z**2/n)
-        ci_hi = (p + z**2/(2*n) + ci_half) / (1 + z**2/n)
-
-        # Per crypto stats
-        by_crypto = {}
-        for crypto in CRYPTOS:
-            ct = [t for t in closed if t.get("crypto") == crypto]
-            if ct:
-                by_crypto[crypto] = {
-                    "trades": len(ct),
-                    "wins": sum(1 for t in ct if t.get("won")),
-                    "pnl": round(sum(t.get("pnl", 0) for t in ct), 2),
-                }
-
-        return {
-            "trades": total_trades,
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(win_rate * 100, 1),
-            "win_rate_ci": f"{ci_lo*100:.1f}%-{ci_hi*100:.1f}%",
-            "total_pnl": round(total_pnl, 2),
-            "total_fees": round(total_fees, 2),
-            "total_staked": round(total_staked, 2),
-            "roi": round(roi, 1),
-            "sharpe": round(sharpe, 2),
-            "avg_pnl": round(avg_pnl, 2),
-            "by_crypto": by_crypto,
-        }
-
-analytics = Analytics()
-
-# ── State ──────────────────────────────────────────────────────────────────────
-price_history: Dict[str, List] = defaultdict(list)
-open_trades: List[Dict] = []
-closed_trades: List[Dict] = []
-kill_switch = False
-
-# ── Kalshi Client ──────────────────────────────────────────────────────────────
-from kalshi_client import KalshiClient
-client = KalshiClient(KALSHI_API_KEY, KALSHI_PRIV_KEY) if not PAPER_MODE else None
-
-# ── Price Fetching ─────────────────────────────────────────────────────────────
-
-async def fetch_kucoin_prices(session: aiohttp.ClientSession) -> Dict[str, float]:
-    try:
-        async with session.get(
-            "https://api.kucoin.com/api/v1/market/allTickers",
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            data = await r.json()
-            prices = {}
-            for t in data.get("data", {}).get("ticker", []):
-                sym = t.get("symbol", "")
-                if sym in ("BTC-USDT", "ETH-USDT", "SOL-USDT"):
-                    prices[sym.split("-")[0]] = float(t.get("last", 0))
-            return prices
-    except Exception as e:
-        logger.warning(f"KuCoin fetch error: {e}")
-        return {}
-
-async def fetch_kalshi_market(session: aiohttp.ClientSession, crypto: str, series: str = None) -> Optional[Dict]:
-    try:
-        s = series or SERIES_15M[crypto]
-        async with session.get(
-            f"{BASE}/trade-api/v2/markets",
-            params={"limit": 3, "status": "open", "series_ticker": s},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            data = await r.json()
-            markets = data.get("markets", [])
-            if markets:
-                m = markets[0]
-                m["_series"] = s
-                return m
-    except Exception as e:
-        logger.debug(f"Kalshi market fetch error {crypto} {series}: {e}")
-    return None
-
-async def fetch_best_market(session: aiohttp.ClientSession, crypto: str) -> Optional[Dict]:
-    """
-    Smart market selection:
-    1. Try hourly market first (deeper liquidity, taker fills)
-    2. Fall back to 15-min market (maker limit order)
-    Returns market dict with _order_type set to "taker" or "maker"
-    """
-    # Try 1H first
-    market_1h = await fetch_kalshi_market(session, crypto, SERIES_1H[crypto])
-    if market_1h:
-        # Check if 1H has reasonable time left (>10 min)
-        close_time = market_1h.get("close_time", "")
-        secs_remaining = 3600
-        if close_time:
-            try:
-                close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                secs_remaining = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
-            except Exception:
-                pass
-        if secs_remaining > 600:  # >10 min left on hourly
-            market_1h["_order_type"] = "taker"
-            market_1h["_secs_remaining"] = secs_remaining
-            logger.info(f"{crypto}: using 1H market {market_1h.get('ticker')} ({secs_remaining:.0f}s) — TAKER")
-            return market_1h
-
-    # Fall back to 15M with maker
-    market_15m = await fetch_kalshi_market(session, crypto, SERIES_15M[crypto])
-    if market_15m:
-        market_15m["_order_type"] = "maker"
-        logger.info(f"{crypto}: using 15M market {market_15m.get('ticker')} — MAKER limit order")
-        return market_15m
-
-    return None
-
-async def fetch_orderbook_depth(session: aiohttp.ClientSession, ticker: str, side: str) -> int:
-    """
-    Check available contracts on the orderbook for a given side.
-    side = "yes" or "no"
-    Returns total available contracts at best price levels.
-    """
-    try:
-        async with session.get(
-            f"{BASE}/trade-api/v2/markets/{ticker}/orderbook",
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            data = await r.json()
-            book = data.get("orderbook", data)
-            
-            # Yes orders = bids, No orders = asks
-            # We are buying YES = we need sellers (asks on yes side)
-            # We are buying NO = we need sellers (asks on no side)
-            if side == "yes":
-                levels = book.get("yes", [])  # yes ask levels
-            else:
-                levels = book.get("no", [])   # no ask levels
-            
-            # Sum available contracts at best 3 price levels
-            total = 0
-            for i, level in enumerate(levels[:3]):
-                if isinstance(level, list) and len(level) >= 2:
-                    total += level[1]  # [price, quantity]
-                elif isinstance(level, dict):
-                    total += level.get("quantity", level.get("count", 0))
-            
-            logger.info(f"Orderbook {ticker} {side.upper()}: {total} contracts available")
-            return int(total)
-    except Exception as e:
-        logger.debug(f"Orderbook fetch error: {e}")
-        return 999  # if we can't check, proceed anyway
-
-# ── Signal Detection ───────────────────────────────────────────────────────────
-
-def signal_quality_score(pct_change: float, secs_remaining: int, yes_price: int) -> float:
-    """
-    Score signal quality 0-100.
-    Higher = better trade opportunity.
-    Factors: momentum strength, time remaining, market price extremity
-    """
-    # Momentum strength (0-40 pts)
-    momentum_score = min(40, abs(pct_change) / THRESHOLD * 20)
-
-    # Time remaining (0-30 pts) — more time = better
-    time_score = min(30, (secs_remaining / 900) * 30)
-
-    # Price extremity (0-30 pts) — away from 50¢ = lower fees + clearer signal
-    price_score = abs(yes_price - 50) / 50 * 30
-
-    return round(momentum_score + time_score + price_score, 1)
-
-def detect_momentum(crypto: str, current_price: float) -> tuple[Optional[str], float]:
-    """Returns (direction, pct_change) or (None, 0)."""
+async def get_book(ticker: str, max_age: float = 1.5) -> Optional[dict]:
     now = time.time()
-    history = price_history[crypto]
-    history.append((now, current_price))
-    price_history[crypto] = [(t, p) for t, p in history if now - t <= 90]
+    hit = _book_cache.get(ticker)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    try:
+        raw = await fetch_json(f"/trade-api/v2/markets/{ticker}/orderbook",
+                               {"depth": 16})
+        parsed = parse_book(raw)
+        _book_cache[ticker] = (now, parsed)
+        return parsed
+    except Exception as e:
+        logger.debug(f"book fetch {ticker}: {e}")
+        return None
 
-    sixty_ago = [(t, p) for t, p in price_history[crypto] if now - t >= 55]
-    if not sixty_ago:
-        return None, 0
 
-    old_price = sixty_ago[0][1]
-    pct_change = (current_price - old_price) / old_price if old_price > 0 else 0
+async def market_refresh_loop():
+    while True:
+        for crypto in CRYPTOS:
+            metas: List[MarketMeta] = []
+            for series in (SERIES_15M[crypto], SERIES_1H[crypto]):
+                try:
+                    data = await fetch_json(
+                        "/trade-api/v2/markets",
+                        {"limit": 8, "status": "open",
+                         "series_ticker": series})
+                    for m in data.get("markets", []) or []:
+                        meta = parse_market(m, crypto, series)
+                        if meta and 0 < meta.tau() < 7200:
+                            metas.append(meta)
+                except Exception as e:
+                    logger.debug(f"market refresh {series}: {e}")
+            metas.sort(key=lambda x: x.close_ts)
+            market_cache[crypto] = metas
+        await asyncio.sleep(20)
 
-    logger.info(f"Momentum check: {crypto} {old_price:.4f}→{current_price:.4f} ({pct_change*100:+.3f}%) threshold={THRESHOLD*100:.2f}%")
 
-    if pct_change >= THRESHOLD:
-        return "UP", pct_change
-    elif pct_change <= -THRESHOLD:
-        return "DOWN", pct_change
-    return None, 0
+def has_exposure(ticker: str) -> bool:
+    if any(p["ticker"] == ticker for p in open_positions):
+        return True
+    return any(pm["ticker"] == ticker for pm in pending_makers.values())
 
-# ── Trade Execution ────────────────────────────────────────────────────────────
 
-async def place_trade(crypto: str, direction: str, market: Dict, pct_change: float, score: float) -> Optional[Dict]:
-    ticker    = market.get("ticker", "")
-    yes_price = market.get("yes_ask", 50)
-    no_price  = market.get("no_ask", 50)
+def sized(price_c: int, depth: int, cap_usd: float) -> int:
+    if price_c <= 0:
+        return 0
+    by_usd = int(cap_usd / (price_c / 100.0))
+    by_depth = int(DEPTH_FRACTION * depth)
+    return max(0, min(MAX_CONTRACTS, by_usd, by_depth))
 
-    side          = "yes" if direction == "UP" else "no"
-    entry_price_c = yes_price if side == "yes" else no_price
-    entry_price_d = entry_price_c / 100
 
-    # Fee calculation
-    fee = kalshi_maker_fee(entry_price_d, STAKE) if USE_LIMIT_ORDERS \
-          else kalshi_taker_fee(entry_price_d, STAKE)
+def _norm_avg_price(v: float, fallback_c: int) -> float:
+    """Kalshi may return avg fill price in dollars or cents. → dollars."""
+    if v <= 0:
+        return fallback_c / 100.0
+    return v / 100.0 if v > 1.5 else v
 
-    # EV calculation using running win rate
-    stats    = analytics.summary()
-    win_rate = stats.get("win_rate", 60) / 100 if stats.get("trades", 0) >= 10 else 0.60
-    ev_data  = expected_value(entry_price_d, STAKE, win_rate, USE_LIMIT_ORDERS)
 
-    trade = {
-        "id":          f"{crypto}_{int(time.time())}",
-        "crypto":      crypto,
-        "direction":   direction,
-        "side":        side,
-        "ticker":      ticker,
-        "entry_price": entry_price_c,
-        "contracts":   STAKE,
-        "stake_usd":   round(entry_price_d * STAKE, 2),
-        "fee":         fee,
-        "pct_change":  round(pct_change * 100, 3),
-        "score":       score,
-        "ev":          ev_data["ev"],
-        "opened_at":   datetime.now(timezone.utc).isoformat(),
-        "status":      "open",
-        "order_id":    None,
-        "order_type":  "limit" if USE_LIMIT_ORDERS else "market",
+# ── Position lifecycle ──────────────────────────────────────────────────────
+def open_position(strategy: str, meta: MarketMeta, side: str, avg_d: float,
+                  contracts: int, fee: float, p_model: float) -> dict:
+    pos = {
+        "id": f"{meta.crypto}_{strategy}_{uuid.uuid4().hex[:8]}",
+        "ts": time.time(), "mode": MODE, "strategy": strategy,
+        "crypto": meta.crypto, "ticker": meta.ticker, "side": side,
+        "entry_cents": round(avg_d * 100, 2), "contracts": contracts,
+        "cost": round(avg_d * contracts, 4), "fee": fee, "status": "open",
+        "model_p": round(p_model, 4), "tau": round(meta.tau(), 1),
+        "close_ts": meta.close_ts, "kind": meta.kind, "strike": meta.strike,
     }
+    open_positions.append(pos)
+    store.insert_trade(pos)
+    return pos
 
+
+async def announce_entry(pos: dict, how: str, note: str = ""):
+    mode = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
+    win = pos["contracts"] * 1.00 - pos["cost"] - pos["fee"]
+    loss = -(pos["cost"] + pos["fee"])
+    await notify(
+        f"{mode} | {pos['strategy'].upper()} {how}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🪙 {pos['crypto']} {pos['side'].upper()} @ "
+        f"{pos['entry_cents']:.0f}¢ ×{pos['contracts']}\n"
+        f"📋 {pos['ticker']}\n"
+        f"🎯 model p={pos['model_p']:.3f} | τ={pos['tau']:.0f}s\n"
+        f"💵 cost ${pos['cost']:.2f} | fee ${pos['fee']:.2f}\n"
+        f"✅ win +${win:.2f} | ❌ loss ${loss:.2f}"
+        + (f"\n{note}" if note else ""))
+
+
+async def execute_taker(strategy: str, meta: MarketMeta, side: str,
+                        limit_c: int, contracts: int, p_model: float,
+                        book: dict) -> Optional[dict]:
+    store.incr("taker_attempts")
+    store.incr("taker_req_contracts", contracts)
     if PAPER_MODE:
-        trade["order_id"] = f"PAPER_{int(time.time())}"
-        logger.info(f"[PAPER] {crypto} {direction} {side.upper()}@{entry_price_c}¢ ×{STAKE} fee=${fee:.4f} EV=${ev_data['ev']:.3f}")
+        filled, vwap_c = PaperBroker.taker_ioc(book, side, limit_c, contracts)
+        if filled < MIN_FILL:
+            logger.info(f"[PAPER taker] {meta.ticker} {side}@≤{limit_c}¢ "
+                        f"insufficient fill ({filled})")
+            return None
+        avg_d = vwap_c / 100.0
+        fee = taker_fee(avg_d, filled)
     else:
         try:
-            order_type = market.get("_order_type", "maker") if market else "maker"
-            if order_type == "taker":
-                # TAKER: instant market order on liquid hourly market
-                resp = client.place_market_order(ticker, side, STAKE, entry_price_d)
-                trade["order_type"] = "taker"
-            else:
-                # MAKER: limit order 2¢ below ask on thin 15M market
-                limit_price_c = max(1, entry_price_c - 2)
-                limit_price_d = limit_price_c / 100
-                resp = client.place_limit_order(ticker, side, STAKE, limit_price_d)
-                trade["entry_price"] = limit_price_c
-                trade["stake_usd"]   = round(limit_price_d * STAKE, 2)
-                trade["limit_price"] = limit_price_c
-                trade["order_type"]  = "maker"
-            trade["order_id"]          = resp.get("order_id", "")
-            fill_count = float(resp.get("fill_count", 0) or 0)
-            avg_price  = float(resp.get("average_fill_price", entry_price_d) or entry_price_d)
-            remaining  = float(resp.get("remaining_count", STAKE) or STAKE)
-            trade["actual_contracts"]  = fill_count
-            trade["actual_cost"]       = round(avg_price * fill_count, 4)
-            trade["pending_contracts"] = remaining
-            logger.info(f"[LIVE {order_type.upper()}] {crypto} {direction} order_id={trade['order_id']} filled={fill_count} pending={remaining}")
+            resp = await asyncio.to_thread(
+                client.buy, meta.ticker, side, limit_c / 100.0, contracts)
         except Exception as e:
-            import traceback
-            logger.error(f"Order failed: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                logger.error(f"Order error detail: {e.response.text[:300]}")
+            logger.error(f"live taker failed {meta.ticker}: {e}")
             return None
+        filled = int(resp.get("fill_count", 0))
+        if filled < 1:
+            logger.info(f"[LIVE taker] {meta.ticker} {side}@≤{limit_c}¢ "
+                        f"no fill (book moved)")
+            return None
+        yes_avg = _norm_avg_price(resp.get("avg_fill_price", 0), limit_c
+                                  if side == "yes" else 100 - limit_c)
+        avg_d = yes_avg if side == "yes" else 1.0 - yes_avg
+        fee = taker_fee(avg_d, filled)
+    store.incr("taker_filled_contracts", filled)
+    pos = open_position(strategy, meta, side, avg_d, filled, fee, p_model)
+    await announce_entry(pos, "TAKER")
+    return pos
 
-    open_trades.append(trade)
-    analytics.add_trade(trade)
-    return trade
 
-# ── Scan Loop ──────────────────────────────────────────────────────────────────
-
-async def scan_loop(app: Application):
-    global kill_switch
-    session = aiohttp.ClientSession()
-    logger.info("Warming up price history (60s)...")
-    await asyncio.sleep(5)
-
-    while True:
-        if kill_switch:
-            await asyncio.sleep(5)
-            continue
-
+async def place_maker(meta: MarketMeta, side: str, price_c: int,
+                      contracts: int, p_model: float, ttl: float):
+    key = f"{meta.ticker}:{side}"
+    intent = {
+        "ticker": meta.ticker, "side": side, "price_c": price_c,
+        "count": contracts, "filled": 0, "p_model": p_model,
+        "expires": time.time() + ttl, "meta": meta, "order_id": "",
+    }
+    if PAPER_MODE:
+        o = paper.place_maker(meta.ticker, side, price_c, contracts, ttl,
+                              {"key": key})
+        intent["order_id"] = o.oid
+    else:
         try:
-            prices = await fetch_kucoin_prices(session)
-            if not prices:
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
-
-            for crypto, price in prices.items():
-                direction, pct_change = detect_momentum(crypto, price)
-                if not direction:
-                    continue
-
-                active = [t for t in open_trades if t["crypto"] == crypto and t["status"] == "open"]
-                if active:
-                    logger.info(f"Already in {crypto} trade, skipping")
-                    continue
-
-                market = await fetch_best_market(session, crypto)
-                if not market:
-                    logger.warning(f"No Kalshi market found for {crypto}")
-                    continue
-
-                ticker    = market.get("ticker", "")
-                yes_price = market.get("yes_ask", 50)
-                no_price  = market.get("no_ask", 50)
-                close_time = market.get("close_time", "")
-
-                secs_remaining = market.get("_secs_remaining", 900)
-                if not market.get("_secs_remaining") and close_time:
-                    try:
-                        close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                        secs_remaining = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
-                    except Exception:
-                        pass
-
-                if secs_remaining < MIN_SECS_LEFT:
-                    logger.info(f"Skip {crypto}: only {secs_remaining:.0f}s remaining (min={MIN_SECS_LEFT}s)")
-                    continue
-
-                entry_price = yes_price if direction == "UP" else no_price
-                score = signal_quality_score(pct_change, secs_remaining, entry_price)
-
-                logger.info(
-                    f"Signal: {crypto} {direction} | {ticker} | "
-                    f"entry={entry_price}¢ | score={score} | {secs_remaining:.0f}s"
-                )
-
-                # MAKER: post limit order on book — no orderbook needed
-
-                trade = await place_trade(crypto, direction, market, pct_change, score)
-                if trade:
-                    mode     = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
-                    order_t  = "📊 LIMIT maker" if trade.get("order_type") == "maker" else "⚡ MARKET taker"
-                    fee      = trade["fee"]
-                    ev       = trade["ev"]
-                    stats    = analytics.summary()
-                    wr_str   = f"{stats['win_rate']}%" if stats.get("trades", 0) > 0 else "N/A"
-
-                    # Use actual fill data — for maker orders show pending stake
-                    actual_c    = trade.get("actual_contracts", 0)
-                    pending_c   = trade.get("pending_contracts", STAKE)
-                    total_c     = actual_c + pending_c
-                    display_stake = trade["stake_usd"]  # always show full intended stake
-                    fill_note   = f"{actual_c:.0f}/{total_c:.0f} filled ({pending_c:.0f} pending)" if pending_c > 0 else f"{actual_c:.0f}/{STAKE} filled"
-                    net_win     = round((0.99 * total_c) - display_stake - fee, 2)
-                    net_loss    = -display_stake
-                    actual_cost = display_stake
-
-                    msg = (
-                        f"{mode} | Momentum Arb v2\n"
-                        f"━━━━━━━━━━━━━━━━\n"
-                        f"🪙 {crypto} {direction} ({trade['pct_change']:+.3f}%)\n"
-                        f"📋 {ticker}\n"
-                        f"💰 {order_t} | {fill_note}\n"
-                        f"   {trade['side'].upper()} @ {trade['entry_price']}¢\n"
-                        f"💵 Staked: ${actual_cost:.2f} | Fee: ${fee:.4f}\n"
-                        f"✅ If win: +${net_win:.2f}\n"
-                        f"❌ If loss: ${net_loss:.2f}\n"
-                        f"📈 EV: ${ev:.3f} | Score: {score}/100\n"
-                        f"⏱️ {secs_remaining:.0f}s | WR: {wr_str}"
-                    )
-                    try:
-                        await app.bot.send_message(chat_id=ALLOWED_USER, text=msg)
-                    except Exception as e:
-                        logger.error(f"Telegram error: {e}")
-
+            resp = await asyncio.to_thread(
+                client.post_bid, meta.ticker, side, price_c / 100.0,
+                contracts, int(time.time() + ttl))
         except Exception as e:
-            logger.error(f"Scan error: {e}", exc_info=True)
+            logger.error(f"live maker post failed {meta.ticker}: {e}")
+            return
+        if int(resp.get("fill_count", 0)) > 0:
+            # post_only should prevent this; safety net
+            logger.warning("post_only order partially crossed?!")
+        intent["order_id"] = resp.get("order_id", "")
+        if not intent["order_id"]:
+            return
+    pending_makers[key] = intent
+    store.incr("maker_placed")
+    store.incr("maker_req_contracts", contracts)
+    logger.info(f"[{MODE} maker] posted {meta.ticker} {side}@{price_c}¢ "
+                f"×{contracts} ttl={ttl:.0f}s")
 
-        await asyncio.sleep(SCAN_INTERVAL)
 
-# ── Resolver ───────────────────────────────────────────────────────────────────
+async def on_paper_maker_fill(order, new_fill: int):
+    key = order.meta.get("key")
+    intent = pending_makers.get(key)
+    if not intent:
+        return
+    meta: MarketMeta = intent["meta"]
+    avg_d = order.price_c / 100.0
+    fee = maker_fee(avg_d, new_fill)
+    store.incr("maker_filled_contracts", new_fill)
+    pos = open_position("conv", meta, intent["side"], avg_d, new_fill, fee,
+                        intent["p_model"])
+    await announce_entry(pos, "MAKER fill")
+    intent["filled"] += new_fill
+    if intent["filled"] >= intent["count"]:
+        pending_makers.pop(key, None)
 
-async def resolver_loop(app: Application):
-    session = aiohttp.ClientSession()
+
+paper.on_maker_fill = on_paper_maker_fill
+
+
+async def poll_live_maker_fills():
+    if PAPER_MODE or not pending_makers:
+        return
+    try:
+        fills = await asyncio.to_thread(client.get_fills, 50)
+    except Exception as e:
+        logger.debug(f"fills poll: {e}")
+        return
+    by_order: Dict[str, List[dict]] = {}
+    for f in fills or []:
+        fid = f.get("trade_id") or f.get("fill_id") or str(f)
+        if fid in consumed_fill_ids:
+            continue
+        oid = f.get("order_id", "")
+        if oid:
+            by_order.setdefault(oid, []).append((fid, f))
+    for key, intent in list(pending_makers.items()):
+        rows = by_order.get(intent["order_id"], [])
+        for fid, f in rows:
+            consumed_fill_ids.add(fid)
+            cnt = int(f.get("count", 0))
+            yes_p = int(f.get("yes_price", 0))
+            side = intent["side"]
+            avg_d = (yes_p if side == "yes" else 100 - yes_p) / 100.0
+            fee = maker_fee(avg_d, cnt)
+            store.incr("maker_filled_contracts", cnt)
+            meta: MarketMeta = intent["meta"]
+            pos = open_position("conv", meta, side, avg_d, cnt, fee,
+                                intent["p_model"])
+            await announce_entry(pos, "MAKER fill")
+            intent["filled"] += cnt
+        if intent["filled"] >= intent["count"]:
+            pending_makers.pop(key, None)
+
+
+def purge_expired_makers():
+    now = time.time()
+    for key, intent in list(pending_makers.items()):
+        if now > intent["expires"] + 3:
+            pending_makers.pop(key, None)
+            logger.info(f"maker expired: {key} "
+                        f"({intent['filled']}/{intent['count']} filled)")
+
+
+# ── CONVERGENCE strategy ────────────────────────────────────────────────────
+def maker_target_price(p_side: float) -> int:
+    """Highest cent price x with p − x − maker_fee(x) ≥ CONV_MIN_EV."""
+    x = p_side - CONV_MIN_EV
+    for _ in range(3):
+        x = p_side - CONV_MIN_EV - maker_fee_pc(max(0.01, min(0.99, x)))
+    return int(math.floor(x * 100))
+
+
+async def convergence_loop():
     while True:
-        await asyncio.sleep(30)
-        for trade in list(open_trades):
-            if trade["status"] != "open":
+        await asyncio.sleep(2.0)
+        try:
+            if in_blackout(BLACKOUTS):
                 continue
-            try:
-                async with session.get(
-                    f"{BASE}/trade-api/v2/markets/{trade['ticker']}",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    data   = await r.json()
+            for crypto in CRYPTOS:
+                if not spot.ready(crypto):
+                    continue
+                vol = spot.vol[crypto]
+                if vol.spike_ratio > SPIKE_MAX:
+                    continue          # vol regime unstable → model unreliable
+                S = spot.price[crypto]
+                for meta in market_cache[crypto]:
+                    tau = meta.tau()
+                    if not (CONV_MIN_TAU <= tau <= CONV_MAX_TAU):
+                        continue
+                    if has_exposure(meta.ticker):
+                        continue
+                    p_yes = meta.p_yes(S, vol.sigma_1s, TAIL_MULT)
+                    if p_yes >= CONV_MIN_P:
+                        side, p_side = "yes", p_yes
+                    elif (1 - p_yes) >= CONV_MIN_P:
+                        side, p_side = "no", 1 - p_yes
+                    else:
+                        continue
+                    ok, why = risk.check(crypto, open_positions)
+                    if not ok:
+                        logger.debug(f"risk block: {why}")
+                        continue
+                    book = await get_book(meta.ticker)
+                    if not book:
+                        continue
+                    ask_c = book[f"{side}_ask"]
+                    ladder = book[f"{side}_asks"]
+                    ask_d = ask_c / 100.0
+                    ev_taker = p_side - ask_d - taker_fee_pc(ask_d)
+                    depth = depth_at(ladder, ask_c)
+                    n = sized(ask_c, depth, MAX_STAKE_USD)
+
+                    if (CONV_PRICE_MIN <= ask_c <= CONV_PRICE_MAX
+                            and ev_taker >= CONV_MIN_EV and n >= MIN_FILL):
+                        await execute_taker("conv", meta, side, ask_c, n,
+                                            p_side, book)
+                        continue
+
+                    if not CONV_MAKER:
+                        continue
+                    tgt = maker_target_price(p_side)
+                    tgt = min(tgt, ask_c - 1, CONV_PRICE_MAX)
+                    bid_c = book[f"{side}_bid"]
+                    if tgt < max(CONV_PRICE_MIN, bid_c) or tgt < 1:
+                        continue      # our price wouldn't be top-of-book
+                    ttl = min(MAKER_TTL, tau - (STOP_MIN_TAU - 5))
+                    if ttl < 6:
+                        continue
+                    n_m = min(MAX_CONTRACTS,
+                              int(MAX_STAKE_USD / (tgt / 100.0)))
+                    if n_m < MIN_FILL:
+                        continue
+                    await place_maker(meta, side, tgt, n_m, p_side, ttl)
+        except Exception:
+            logger.exception("convergence loop error")
+
+
+# ── LAG strategy ────────────────────────────────────────────────────────────
+async def lag_loop():
+    while True:
+        await asyncio.sleep(0.5)
+        if not LAG_ENABLED:
+            continue
+        try:
+            if in_blackout(BLACKOUTS):
+                continue
+            now = time.time()
+            for crypto in CRYPTOS:
+                if now < lag_cooldown[crypto] or not spot.ready(crypto):
+                    continue
+                r, dt = spot.move_over(crypto, LAG_LOOKBACK)
+                if dt <= 0:
+                    continue
+                sig = spot.vol[crypto].sigma_1s * math.sqrt(max(dt, 0.5))
+                z = abs(r) / sig if sig > 0 else 0
+                if z < LAG_Z or abs(r) < LAG_MIN_MOVE:
+                    continue
+                lag_cooldown[crypto] = now + LAG_COOLDOWN
+                logger.info(f"⚡ burst {crypto}: {r*100:+.3f}% in {dt:.1f}s "
+                            f"(z={z:.1f}) — scanning for lagging quotes")
+                await lag_evaluate(crypto)
+        except Exception:
+            logger.exception("lag loop error")
+
+
+async def lag_evaluate(crypto: str):
+    S = spot.price[crypto]
+    vol = spot.vol[crypto]
+    best = None
+    for meta in market_cache[crypto]:
+        tau = meta.tau()
+        if not (LAG_MIN_TAU <= tau <= LAG_MAX_TAU):
+            continue
+        if has_exposure(meta.ticker):
+            continue
+        p_yes = meta.p_yes(S, vol.sigma_1s, TAIL_MULT)
+        book = await get_book(meta.ticker, max_age=0.0)   # must be fresh
+        if not book:
+            continue
+        for side, p_side in (("yes", p_yes), ("no", 1 - p_yes)):
+            ask_c = book[f"{side}_ask"]
+            if not (5 <= ask_c <= 95):
+                continue
+            ask_d = ask_c / 100.0
+            ev = p_side - ask_d - taker_fee_pc(ask_d)
+            if ev < LAG_MIN_EV:
+                continue
+            depth = depth_at(book[f"{side}_asks"], ask_c)
+            n = sized(ask_c, depth, MAX_STAKE_USD)
+            if n < MIN_FILL:
+                continue
+            if best is None or ev > best[0]:
+                best = (ev, meta, side, ask_c, n, p_side, book)
+    if not best:
+        logger.info(f"{crypto}: burst but no lagging quotes (MMs already "
+                    f"repriced) — correctly standing down")
+        return
+    ev, meta, side, ask_c, n, p_side, book = best
+    ok, why = risk.check(crypto, open_positions)
+    if not ok:
+        logger.info(f"lag blocked: {why}")
+        return
+    await execute_taker("lag", meta, side, ask_c, n, p_side, book)
+
+
+# ── Resolver: settlement, stops, maker bookkeeping ──────────────────────────
+async def close_position(pos: dict, result: str, pnl: float, reason: str):
+    pos["status"] = "closed"
+    store.close_trade(pos["id"], result, round(pnl, 2), reason)
+    if pos in open_positions:
+        open_positions.remove(pos)
+    s = store.summary(MODE)
+    emoji = "✅ WIN" if pnl > 0 else "❌ LOSS"
+    mode = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
+    await notify(
+        f"{emoji} | {mode} | {pos['strategy'].upper()} ({reason})\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🪙 {pos['crypto']} {pos['side'].upper()} "
+        f"@{pos['entry_cents']:.0f}¢ ×{pos['contracts']}\n"
+        f"P&L: ${pnl:+.2f}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"📊 {s.get('trades',0)} trades | WR {s.get('win_rate',0)}% "
+        f"({s.get('wr_ci','–')})\n"
+        f"Total P&L: ${s.get('pnl',0):+.2f} | fees ${s.get('fees',0):.2f}\n"
+        f"Today: ${store.daily_pnl(MODE):+.2f}")
+
+
+async def try_stop_loss(pos: dict):
+    crypto = pos["crypto"]
+    if not spot.ready(crypto):
+        return
+    tau = max(0.0, pos["close_ts"] - time.time())
+    if tau <= STOP_MIN_TAU:
+        return
+    meta = MarketMeta(pos["ticker"], crypto, "", pos["kind"], pos["strike"],
+                      pos["close_ts"], {})
+    p_now = meta.p_yes(spot.price[crypto], spot.vol[crypto].sigma_1s,
+                       TAIL_MULT)
+    p_side = p_now if pos["side"] == "yes" else 1 - p_now
+    if p_side >= STOP_P:
+        return
+    book = await get_book(pos["ticker"], max_age=0.0)
+    if not book:
+        return
+    bid_c = book[f"{pos['side']}_bid"]
+    if bid_c < 3:
+        return   # nothing to salvage
+    n = pos["contracts"]
+    if PAPER_MODE:
+        bids = book[f"{pos['side']}_bids"]
+        avail = sum(c for p, c in bids if p >= bid_c)
+        filled = min(n, avail)
+        avg_d = bid_c / 100.0
+    else:
+        try:
+            resp = await asyncio.to_thread(
+                client.exit, pos["ticker"], pos["side"], bid_c / 100.0, n)
+        except Exception as e:
+            logger.error(f"stop exit failed: {e}")
+            return
+        filled = int(resp.get("fill_count", 0))
+        yes_avg = _norm_avg_price(resp.get("avg_fill_price", 0),
+                                  bid_c if pos["side"] == "yes"
+                                  else 100 - bid_c)
+        avg_d = yes_avg if pos["side"] == "yes" else 1.0 - yes_avg
+    if filled < 1:
+        return
+    exit_fee = taker_fee(avg_d, filled)
+    entry_pc = pos["cost"] / pos["contracts"]
+    fee_pc = pos["fee"] / pos["contracts"]
+    realized = filled * (avg_d - entry_pc - fee_pc) - exit_fee
+    if filled >= n:
+        await close_position(pos, "stopped", realized, "stop-loss")
+    else:
+        rem = n - filled
+        residual = dict(pos)
+        residual["id"] = pos["id"] + "-r"
+        residual["contracts"] = rem
+        residual["cost"] = round(entry_pc * rem, 4)
+        residual["fee"] = round(fee_pc * rem, 4)
+        store.insert_trade(residual)
+        open_positions.append(residual)
+        await close_position(pos, "stopped-partial", realized,
+                             "stop-loss partial")
+
+
+async def resolver_loop():
+    while True:
+        await asyncio.sleep(12)
+        try:
+            purge_expired_makers()
+            await poll_live_maker_fills()
+            for pos in list(open_positions):
+                try:
+                    data = await fetch_json(
+                        f"/trade-api/v2/markets/{pos['ticker']}")
                     market = data.get("market", {})
-                    status = market.get("status", "")
-
-                # Cancel pending limit orders if market is closing
-                if status in ("closed", "finalized") and trade.get("pending_contracts", 0) > 0 and trade.get("order_id") and not PAPER_MODE:
-                    try:
-                        async with session.delete(
-                            f"{BASE}/trade-api/v2/portfolio/orders/{trade['order_id']}",
-                            timeout=aiohttp.ClientTimeout(total=5)
-                        ) as cr:
-                            logger.info(f"Cancelled pending limit order: {cr.status}")
-                    except Exception as ce:
-                        logger.debug(f"Cancel error: {ce}")
-
-                if status == "finalized":
+                except Exception:
+                    continue
+                status = market.get("status", "")
+                if status in ("finalized", "settled"):
                     result = market.get("result", "")
-                    won = (trade["side"] == "yes" and result == "yes") or \
-                          (trade["side"] == "no" and result == "no")
+                    won = (result == pos["side"])
+                    pnl = (pos["contracts"] * 1.00 - pos["cost"] - pos["fee"]
+                           if won else -(pos["cost"] + pos["fee"]))
+                    await close_position(pos, result, pnl, "settlement")
+                elif status in ("open", "active"):
+                    await try_stop_loss(pos)
+        except Exception:
+            logger.exception("resolver error")
 
-                    # Try to get actual fill data from Kalshi
-                    actual_contracts = trade["contracts"]
-                    actual_cost = trade["stake_usd"]
-                    if trade.get("order_id") and not PAPER_MODE:
-                        try:
-                            ord_path = f"/trade-api/v2/portfolio/orders/{trade['order_id']}"
-                            async with session.get(
-                                f"{BASE}{ord_path}",
-                                timeout=aiohttp.ClientTimeout(total=5)
-                            ) as ord_r:
-                                ord_data = await ord_r.json()
-                                order = ord_data.get("order", ord_data)
-                                fill_count = float(order.get("fill_count", trade["contracts"]) or trade["contracts"])
-                                avg_price  = float(order.get("average_fill_price", trade["entry_price"]/100) or trade["entry_price"]/100)
-                                actual_contracts = fill_count
-                                actual_cost = round(avg_price * fill_count, 4)
-                        except Exception as ex:
-                            logger.debug(f"Could not fetch order details: {ex}")
 
-                    gross_pnl = round((0.99 - actual_cost/actual_contracts) * actual_contracts, 4) if won and actual_contracts > 0 \
-                                else -actual_cost
-                    actual_fee = round(0.07 * (actual_cost/actual_contracts if actual_contracts > 0 else 0.5) * \
-                                (1 - actual_cost/actual_contracts if actual_contracts > 0 else 0.5) * actual_contracts, 4)
-                    net_pnl = round(gross_pnl - actual_fee, 2) if won else round(gross_pnl, 2)
-                    trade["actual_contracts"] = actual_contracts
-                    trade["actual_cost"] = actual_cost
+async def paper_maker_poll_loop():
+    while True:
+        await asyncio.sleep(2.5)
+        if PAPER_MODE:
+            try:
+                await paper.tick()
+            except Exception:
+                logger.exception("paper tick error")
 
-                    trade["status"]    = "closed"
-                    trade["pnl"]       = net_pnl
-                    trade["won"]       = won
-                    trade["result"]    = result
-                    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
 
-                    open_trades.remove(trade)
-                    closed_trades.append(trade)
-                    analytics.add_trade(trade)
+# ── Telegram UI ─────────────────────────────────────────────────────────────
+def panel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 P&L", callback_data="pnl"),
+         InlineKeyboardButton("🧠 Strategies", callback_data="strat")],
+        [InlineKeyboardButton("📂 Positions", callback_data="pos"),
+         InlineKeyboardButton("🎯 Fill stats", callback_data="fills")],
+        [InlineKeyboardButton("💰 Balance", callback_data="bal"),
+         InlineKeyboardButton("🔧 Settings", callback_data="cfg")],
+        [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
+         InlineKeyboardButton("▶️ Resume", callback_data="resume")],
+    ])
 
-                    stats   = analytics.summary()
-                    emoji   = "✅ WIN" if won else "❌ LOSS"
-                    mode    = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
-                    running_pnl = stats.get("total_pnl", 0)
-                    wr      = stats.get("win_rate", 0)
-                    wr_ci   = stats.get("win_rate_ci", "N/A")
 
-                    actual_c2 = trade.get("actual_contracts", trade["contracts"])
-                    msg = (
-                        f"{emoji} | {mode}\n"
-                        f"━━━━━━━━━━━━━━━━\n"
-                        f"🪙 {trade['crypto']} {trade['direction']}\n"
-                        f"Result: {result.upper()}\n"
-                        f"Filled: {actual_c2:.0f} contracts\n"
-                        f"P&L this trade: ${net_pnl:+.2f}\n"
-                        f"Fee paid: ${actual_fee:.4f}\n"
-                        f"━━━━━━━━━━━━━━━━\n"
-                        f"📊 Session Stats\n"
-                        f"Trades: {stats.get('trades', 0)} | "
-                        f"WR: {wr}% ({wr_ci})\n"
-                        f"Total P&L: ${running_pnl:+.2f}\n"
-                        f"Total fees: ${stats.get('total_fees', 0):.4f}"
-                    )
-                    try:
-                        await app.bot.send_message(chat_id=ALLOWED_USER, text=msg)
-                    except Exception:
-                        pass
-                    logger.info(f"Resolved: {trade['crypto']} P&L=${net_pnl:+.2f} WR={wr}%")
+def txt_pnl() -> str:
+    s = store.summary(MODE)
+    if not s.get("trades"):
+        return "No closed trades yet."
+    return (f"📊 P&L [{MODE.upper()}]\n━━━━━━━━━━━━\n"
+            f"Trades: {s['trades']} | WR {s['win_rate']}% ({s['wr_ci']})\n"
+            f"W/L: {s['wins']}/{s['losses']}\n"
+            f"P&L: ${s['pnl']:+.2f} | fees ${s['fees']:.2f}\n"
+            f"Staked: ${s['staked']:.2f} | ROI {s['roi']}%\n"
+            f"Avg/trade ${s['avg']:+.3f} | Sharpe {s['sharpe']}\n"
+            f"Today: ${store.daily_pnl(MODE):+.2f}")
 
-            except Exception as e:
-                logger.debug(f"Resolver error: {e}")
 
-# ── Telegram Commands ──────────────────────────────────────────────────────────
+def txt_strat() -> str:
+    s = store.summary(MODE)
+    lines = [f"🧠 By strategy [{MODE.upper()}]", "━━━━━━━━━━━━"]
+    for name, d in (s.get("by_strategy") or {}).items():
+        wr = d["w"] / d["n"] * 100 if d["n"] else 0
+        lines.append(f"{name}: {d['n']}T {wr:.0f}%WR ${d['pnl']:+.2f}")
+    lines.append("━━━━━━━━━━━━")
+    for name, d in (s.get("by_crypto") or {}).items():
+        wr = d["w"] / d["n"] * 100 if d["n"] else 0
+        lines.append(f"{name}: {d['n']}T {wr:.0f}%WR ${d['pnl']:+.2f}")
+    return "\n".join(lines) if len(lines) > 3 else "No closed trades yet."
+
+
+def txt_fills() -> str:
+    mp = store.get_kv("maker_placed")
+    mrc = store.get_kv("maker_req_contracts")
+    mfc = store.get_kv("maker_filled_contracts")
+    ta = store.get_kv("taker_attempts")
+    trc = store.get_kv("taker_req_contracts")
+    tfc = store.get_kv("taker_filled_contracts")
+    mr = (mfc / mrc * 100) if mrc else 0
+    tr = (tfc / trc * 100) if trc else 0
+    return (f"🎯 Fill stats [{MODE.upper()}]\n━━━━━━━━━━━━\n"
+            f"Maker: {mp:.0f} posted | {mfc:.0f}/{mrc:.0f} contracts "
+            f"({mr:.0f}%)\n"
+            f"Taker: {ta:.0f} sent | {tfc:.0f}/{trc:.0f} contracts "
+            f"({tr:.0f}%)\n"
+            f"Pending makers: {len(pending_makers)}\n\n"
+            f"These are REAL fill rates — the number paper mode\n"
+            f"used to lie to you about.")
+
+
+def txt_cfg() -> str:
+    return (f"🔧 v3 config\nMode: {MODE.upper()}\n"
+            f"CONV: p≥{CONV_MIN_P} ev≥{CONV_MIN_EV*100:.1f}¢ "
+            f"τ∈[{CONV_MIN_TAU:.0f},{CONV_MAX_TAU:.0f}]s "
+            f"px∈[{CONV_PRICE_MIN},{CONV_PRICE_MAX}]¢ "
+            f"maker={'on' if CONV_MAKER else 'off'} ttl={MAKER_TTL:.0f}s\n"
+            f"LAG: z≥{LAG_Z} ev≥{LAG_MIN_EV*100:.0f}¢ "
+            f"τ∈[{LAG_MIN_TAU:.0f},{LAG_MAX_TAU:.0f}]s "
+            f"{'on' if LAG_ENABLED else 'off'}\n"
+            f"Size: ≤{MAX_CONTRACTS}c ≤${MAX_STAKE_USD:.0f} "
+            f"depth≤{DEPTH_FRACTION*100:.0f}% minfill={MIN_FILL}\n"
+            f"Risk: concurrent≤{MAX_CONCURRENT} percrypto≤{PER_CRYPTO} "
+            f"dayloss≤${MAX_DAILY_LOSS:.0f} stop@p<{STOP_P}\n"
+            f"Model: tail×{TAIL_MULT} spike<{SPIKE_MAX}\n"
+            f"Blackouts UTC: {os.getenv('NEWS_BLACKOUT_UTC','default')}")
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER:
         return
-    mode     = "📄 PAPER" if PAPER_MODE else "💵 LIVE"
-    order_t  = "📊 LIMIT (maker)" if USE_LIMIT_ORDERS else "⚡ MARKET (taker)"
-    kb = [
-        [InlineKeyboardButton("📊 Full P&L", callback_data="pnl"),
-         InlineKeyboardButton("🏆 By Crypto", callback_data="by_crypto")],
-        [InlineKeyboardButton("📂 Positions", callback_data="positions"),
-         InlineKeyboardButton("💰 Balance", callback_data="balance")],
-        [InlineKeyboardButton("💡 EV Calc", callback_data="ev"),
-         InlineKeyboardButton("🔧 Settings", callback_data="settings")],
-        [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
-         InlineKeyboardButton("▶️ Resume", callback_data="resume")],
-    ]
     await update.message.reply_text(
-        f"🤖 Kalshi Arb Bot v2\n"
-        f"Mode: {mode} | {order_t}\n"
-        f"Threshold: {THRESHOLD*100:.2f}% | Stake: {STAKE}c | Min: {MIN_SECS_LEFT}s",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+        f"🤖 Kalshi Bot v3 [{MODE.upper()}]\n"
+        f"Convergence + Lag | {', '.join(CRYPTOS)}", reply_markup=panel())
 
-def handle_pnl():
-    stats = analytics.summary()
-    if not stats.get("trades"):
-        text = "No closed trades yet."
-    else:
-        text = (
-            f"📊 P&L Report\n"
-            f"━━━━━━━━━━━━\n"
-            f"Trades: {stats['trades']} | WR: {stats['win_rate']}%\n"
-            f"95% CI: {stats['win_rate_ci']}\n"
-            f"Wins: {stats['wins']} | Losses: {stats['losses']}\n"
-            f"━━━━━━━━━━━━\n"
-            f"Total P&L: ${stats['total_pnl']:+.2f}\n"
-            f"Total fees: ${stats['total_fees']:.4f}\n"
-            f"Total staked: ${stats['total_staked']:.2f}\n"
-            f"ROI: {stats['roi']}%\n"
-            f"Avg P&L/trade: ${stats['avg_pnl']:+.2f}\n"
-            f"Sharpe: {stats['sharpe']}"
-        )
-    return text
 
-def handle_by_crypto():
-    stats = analytics.summary()
-    by = stats.get("by_crypto", {})
-    if not by:
-        return "No trades yet."
-    lines = ["🏆 By Crypto\n━━━━━━━━━━━━"]
-    for crypto, s in by.items():
-        wr = round(s['wins']/s['trades']*100, 1) if s['trades'] > 0 else 0
-        lines.append(f"{crypto}: {s['trades']}T {wr}%WR ${s['pnl']:+.2f}")
-    return "\n".join(lines)
+async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER:
+        return
+    await update.message.reply_text(txt_pnl())
 
-def handle_ev():
-    stats    = analytics.summary()
-    win_rate = stats.get("win_rate", 60) / 100 if stats.get("trades", 0) >= 5 else 0.60
-    ev_t     = expected_value(0.50, STAKE, win_rate, False)
-    ev_m     = expected_value(0.50, STAKE, win_rate, True)
-    text = (
-        f"💡 EV Calculator (50¢ entry)\n"
-        f"━━━━━━━━━━━━\n"
-        f"Win rate: {win_rate*100:.1f}%\n"
-        f"Contracts: {STAKE} | Stake: ${ev_t['stake']}\n"
-        f"━━━━━━━━━━━━\n"
-        f"⚡ MARKET (taker)\n"
-        f"  Fee: ${ev_t['fee']} | EV: ${ev_t['ev']}\n"
-        f"  Break-even WR: {ev_t['breakeven_wr']}%\n"
-        f"━━━━━━━━━━━━\n"
-        f"📊 LIMIT (maker)\n"
-        f"  Fee: ${ev_m['fee']} | EV: ${ev_m['ev']}\n"
-        f"  Break-even WR: {ev_m['breakeven_wr']}%\n"
-        f"━━━━━━━━━━━━\n"
-        f"💰 Kelly sizing @ {win_rate*100:.0f}%WR: "
-        f"{kelly_contracts(win_rate, 0.50, 100)} contracts"
-    )
-    return text
 
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global kill_switch
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if update.effective_user.id != ALLOWED_USER:
         return
     await q.answer()
-
-    if q.data == "pnl":
-        await q.edit_message_text(handle_pnl())
-    elif q.data == "by_crypto":
-        await q.edit_message_text(handle_by_crypto())
-    elif q.data == "positions":
-        active = [t for t in open_trades if t["status"] == "open"]
-        if not active:
-            await q.edit_message_text("No open positions")
+    d = q.data
+    if d == "pnl":
+        await q.edit_message_text(txt_pnl())
+    elif d == "strat":
+        await q.edit_message_text(txt_strat())
+    elif d == "pos":
+        if not open_positions and not pending_makers:
+            await q.edit_message_text("No open positions or resting orders.")
         else:
-            lines = ["📂 Open Positions"]
-            for t in active:
-                lines.append(f"• {t['crypto']} {t['direction']} {t['side'].upper()}@{t['entry_price']}¢ score={t['score']}")
+            lines = ["📂 Open"]
+            for p in open_positions:
+                tau = max(0, p["close_ts"] - time.time())
+                lines.append(f"• {p['crypto']} {p['side'].upper()}"
+                             f"@{p['entry_cents']:.0f}¢×{p['contracts']} "
+                             f"[{p['strategy']}] τ{tau:.0f}s")
+            for k, m in pending_makers.items():
+                lines.append(f"◦ resting {m['ticker']} {m['side']}"
+                             f"@{m['price_c']}¢×{m['count']}")
             await q.edit_message_text("\n".join(lines))
-    elif q.data == "balance":
+    elif d == "fills":
+        await q.edit_message_text(txt_fills())
+    elif d == "bal":
         if PAPER_MODE:
-            stats = analytics.summary()
-            pnl = stats.get("total_pnl", 0)
-            await q.edit_message_text(f"💰 Paper Balance: ${100 + pnl:.2f}")
+            s = store.summary(MODE)
+            await q.edit_message_text(
+                f"💰 Paper P&L: ${s.get('pnl', 0):+.2f}")
         else:
             try:
-                bal = client.get_balance()
+                bal = await asyncio.to_thread(client.get_balance)
                 await q.edit_message_text(f"💰 Balance: ${bal:.2f}")
             except Exception as e:
                 await q.edit_message_text(f"Balance error: {e}")
-    elif q.data == "ev":
-        await q.edit_message_text(handle_ev())
-    elif q.data == "settings":
-        await q.edit_message_text(
-            f"🔧 Settings\n"
-            f"PAPER_MODE: {PAPER_MODE}\n"
-            f"STAKE: {STAKE} contracts\n"
-            f"THRESHOLD: {THRESHOLD*100:.2f}%\n"
-            f"MIN_SECS_LEFT: {MIN_SECS_LEFT}s\n"
-            f"USE_LIMIT_ORDERS: {USE_LIMIT_ORDERS}"
-        )
-    elif q.data == "kill":
-        kill_switch = True
-        await q.edit_message_text("🚨 Kill switch ACTIVATED")
-    elif q.data == "resume":
-        kill_switch = False
-        await q.edit_message_text("▶️ Trading RESUMED")
+    elif d == "cfg":
+        await q.edit_message_text(txt_cfg())
+    elif d == "kill":
+        risk.kill = True
+        await q.edit_message_text("🚨 Kill switch ON — no new entries.")
+    elif d == "resume":
+        risk.kill = False
+        risk.halted_reason = ""
+        await q.edit_message_text("▶️ Trading resumed.")
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+
+# ── Main ────────────────────────────────────────────────────────────────────
+async def on_startup(app: Application):
+    global http, tg_app
+    tg_app = app
+    http = aiohttp.ClientSession()
+
+    for row in store.open_trades(MODE):
+        row["status"] = "open"
+        open_positions.append(row)
+
+    await spot.start()
+    asyncio.create_task(market_refresh_loop())
+    asyncio.create_task(convergence_loop())
+    asyncio.create_task(lag_loop())
+    asyncio.create_task(resolver_loop())
+    asyncio.create_task(paper_maker_poll_loop())
+
+    await notify(
+        f"🤖 Kalshi Bot v3 STARTED [{MODE.upper()}]\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"Strategy 1 — CONVERGENCE: final {CONV_MIN_TAU:.0f}–"
+        f"{CONV_MAX_TAU:.0f}s of 15M *and* 1H markets, buy p≥"
+        f"{CONV_MIN_P} favorites with ≥{CONV_MIN_EV*100:.1f}¢ edge "
+        f"(taker or self-expiring maker)\n"
+        f"Strategy 2 — LAG: spot bursts z≥{LAG_Z}, take only if book "
+        f"lags fair by ≥{LAG_MIN_EV*100:.0f}¢ net of fees\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"⚠️ v3 trades much less often than v2 — that is the point.\n"
+        f"Every skipped trade is a bad fill you're not paying for.\n"
+        f"Fills, fees and paper results are now real. /start for panel."
+        + (f"\n\n♻️ Restored {len(open_positions)} open position(s)."
+           if open_positions else ""))
+
 
 def main():
-    mode    = "PAPER" if PAPER_MODE else "LIVE"
-    order_t = "LIMIT/maker" if USE_LIMIT_ORDERS else "MARKET/taker"
-    logger.info(f"🤖 Kalshi Arb Bot v2 [{mode}] [{order_t}]")
-
+    logger.info(f"Kalshi Bot v3 [{MODE}] cryptos={CRYPTOS}")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(handle_pnl())
     app.add_handler(CommandHandler("pnl", cmd_pnl))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    async def on_startup(application):
-        stats    = analytics.summary()
-        ev_data  = expected_value(0.50, STAKE, 0.60, USE_LIMIT_ORDERS)
-        order_t2 = "LIMIT (maker ~0% fee)" if USE_LIMIT_ORDERS else "MARKET (taker fee)"
-
-        await application.bot.send_message(
-            chat_id=ALLOWED_USER,
-            text=(
-                f"🤖 Kalshi Arb Bot v2 STARTED\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"Mode: {'📄 PAPER' if PAPER_MODE else '💵 LIVE'}\n"
-                f"Order type: {order_t2}\n"
-                f"Markets: BTC, ETH, SOL 15-min\n"
-                f"Threshold: {THRESHOLD*100:.2f}%\n"
-                f"Stake: {STAKE} contracts\n"
-                f"Min time: {MIN_SECS_LEFT}s\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"💡 EV at 50¢, 60% WR:\n"
-                f"  Fee: ${ev_data['fee']:.4f}\n"
-                f"  EV: ${ev_data['ev']:.3f}/trade\n"
-                f"  Break-even WR: {ev_data['breakeven_wr']}%"
-            )
-        )
-        asyncio.create_task(scan_loop(application))
-        asyncio.create_task(resolver_loop(application))
-
+    app.add_handler(CallbackQueryHandler(on_button))
     app.post_init = on_startup
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
