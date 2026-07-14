@@ -387,19 +387,23 @@ async def scan_loop(app: Application):
                     stats    = analytics.summary()
                     wr_str   = f"{stats['win_rate']}%" if stats.get("trades", 0) > 0 else "N/A"
 
-                    net_win  = round((0.99 - trade["entry_price"]/100) * STAKE - fee, 2)
-                    net_loss = -trade["stake_usd"]
+                    # Use actual fill data if available
+                    actual_c    = trade.get("actual_contracts", STAKE)
+                    actual_cost = trade.get("actual_cost", trade["stake_usd"])
+                    fill_note   = f"{actual_c:.0f}/{STAKE} filled" if actual_c < STAKE else f"{STAKE} filled"
+                    net_win     = round((0.99 * actual_c) - actual_cost - fee, 2)
+                    net_loss    = -actual_cost
 
                     msg = (
                         f"{mode} | Momentum Arb v2\n"
                         f"━━━━━━━━━━━━━━━━\n"
                         f"🪙 {crypto} {direction} ({trade['pct_change']:+.3f}%)\n"
                         f"📋 {ticker}\n"
-                        f"💰 {order_t}\n"
-                        f"   {trade['side'].upper()} @ {trade['entry_price']}¢ × {STAKE}\n"
-                        f"💵 Stake: ${trade['stake_usd']:.2f} | Fee: ${fee:.4f}\n"
-                        f"✅ Net Win: +${net_win:.2f}\n"
-                        f"❌ Net Loss: ${net_loss:.2f}\n"
+                        f"💰 {order_t} | {fill_note}\n"
+                        f"   {trade['side'].upper()} @ {trade['entry_price']}¢\n"
+                        f"💵 Staked: ${actual_cost:.2f} | Fee: ${fee:.4f}\n"
+                        f"✅ If win: +${net_win:.2f}\n"
+                        f"❌ If loss: ${net_loss:.2f}\n"
                         f"📈 EV: ${ev:.3f} | Score: {score}/100\n"
                         f"⏱️ {secs_remaining:.0f}s | WR: {wr_str}"
                     )
@@ -480,13 +484,15 @@ async def resolver_loop(app: Application):
                     wr      = stats.get("win_rate", 0)
                     wr_ci   = stats.get("win_rate_ci", "N/A")
 
+                    actual_c2 = trade.get("actual_contracts", trade["contracts"])
                     msg = (
                         f"{emoji} | {mode}\n"
                         f"━━━━━━━━━━━━━━━━\n"
                         f"🪙 {trade['crypto']} {trade['direction']}\n"
                         f"Result: {result.upper()}\n"
+                        f"Filled: {actual_c2:.0f} contracts\n"
                         f"P&L this trade: ${net_pnl:+.2f}\n"
-                        f"Fee paid: ${trade['fee']:.4f}\n"
+                        f"Fee paid: ${actual_fee:.4f}\n"
                         f"━━━━━━━━━━━━━━━━\n"
                         f"📊 Session Stats\n"
                         f"Trades: {stats.get('trades', 0)} | "
