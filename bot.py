@@ -304,7 +304,10 @@ async def place_trade(crypto: str, direction: str, market: Dict, pct_change: flo
             trade["order_id"] = resp.get("order_id", "")
             logger.info(f"[LIVE] {crypto} {direction} order_id={trade['order_id']}")
         except Exception as e:
+            import traceback
             logger.error(f"Order failed: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                logger.error(f"Order error detail: {e.response.text[:300]}")
             return None
 
     open_trades.append(trade)
