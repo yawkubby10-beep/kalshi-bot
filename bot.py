@@ -365,10 +365,21 @@ async def poll_live_maker_fills():
             pending_makers.pop(key, None)
 
 
-def purge_expired_makers():
+async def purge_expired_makers():
     now = time.time()
     for key, intent in list(pending_makers.items()):
         if now > intent["expires"] + 3:
+            # Belt-and-braces: even though orders carry a server-side
+            # expiration_time, force-cancel in live mode in case the venue
+            # rejected/ignored that field. Stale resting orders get picked off.
+            if not PAPER_MODE and intent.get("order_id"):
+                try:
+                    ok = await asyncio.to_thread(
+                        client.cancel_order, intent["order_id"])
+                    logger.info(f"live maker cancel {key}: "
+                                f"{'ok' if ok else 'already gone'}")
+                except Exception as e:
+                    logger.warning(f"live maker cancel {key} failed: {e}")
             pending_makers.pop(key, None)
             logger.info(f"maker expired: {key} "
                         f"({intent['filled']}/{intent['count']} filled)")
@@ -601,7 +612,7 @@ async def resolver_loop():
     while True:
         await asyncio.sleep(12)
         try:
-            purge_expired_makers()
+            await purge_expired_makers()
             await poll_live_maker_fills()
             for pos in list(open_positions):
                 try:
