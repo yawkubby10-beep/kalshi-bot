@@ -891,6 +891,34 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+_conflict_notify = {"t": 0.0}
+
+
+async def on_tg_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.error import Conflict, NetworkError, TimedOut
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(
+            "Telegram Conflict: ANOTHER instance is polling this token "
+            "(duplicate Railway deployment/replica, or an old copy running "
+            "elsewhere). This instance keeps retrying; trading loops are "
+            "unaffected.")
+        now = time.time()
+        if now - _conflict_notify["t"] > 1800:
+            _conflict_notify["t"] = now
+            await notify(
+                "⚠️ Duplicate bot instance detected (Telegram getUpdates "
+                "conflict). Check Railway Deployments for two Active "
+                "deploys / replicas>1, or an old copy running elsewhere. "
+                "If the other copy is the old v2 bot, kill it — it has the "
+                "broken order logic.")
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Telegram network hiccup: {err}")
+        return
+    logger.error("Unhandled Telegram error", exc_info=err)
+
+
 async def on_startup(app: Application):
     global http, tg_app
     tg_app = app
@@ -931,6 +959,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_tg_error)
     app.post_init = on_startup
     app.run_polling(drop_pending_updates=True)
 
