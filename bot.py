@@ -54,6 +54,10 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO)
+# httpx logs full Telegram URLs at INFO — which contain the bot token.
+# Silence it (and its transport) so credentials never hit the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("bot")
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -679,6 +683,27 @@ async def resolver_loop():
             logger.exception("resolver error")
 
 
+async def heartbeat_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            prices = " ".join(
+                f"{c}:{spot.price.get(c, 0):,.0f}" for c in CRYPTOS)
+            windows = sum(
+                1 for c in CRYPTOS for m in market_cache[c]
+                if CONV_MIN_TAU <= m.tau() <= CONV_MAX_TAU)
+            logger.info(
+                f"💓 {prices} | ws={'up' if spot.ws_alive else 'FALLBACK'}"
+                f" | mkts={sum(len(v) for v in market_cache.values())}"
+                f" in-window={windows}"
+                f" | evald={store.get_kv('f_eval'):.0f}"
+                f" | open={len(open_positions)}"
+                f" resting={len(pending_makers)}"
+                f" | today=${store.daily_pnl(MODE):+.2f}")
+        except Exception:
+            logger.exception("heartbeat error")
+
+
 async def paper_maker_poll_loop():
     while True:
         await asyncio.sleep(2.5)
@@ -881,6 +906,7 @@ async def on_startup(app: Application):
     asyncio.create_task(lag_loop())
     asyncio.create_task(resolver_loop())
     asyncio.create_task(paper_maker_poll_loop())
+    asyncio.create_task(heartbeat_loop())
 
     await notify(
         f"🤖 Kalshi Bot v3 STARTED [{MODE.upper()}]\n"
