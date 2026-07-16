@@ -99,6 +99,8 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USD", "15"))
 # Model
 TAIL_MULT = float(os.getenv("TAIL_MULT", "1.25"))
 SPIKE_MAX = float(os.getenv("SPIKE_MAX", "2.5"))
+CHOP_MAX_BURSTS = int(os.getenv("CHOP_MAX_BURSTS", "3"))
+CHOP_WINDOW_S = float(os.getenv("CHOP_WINDOW_S", "600"))
 BLACKOUTS = parse_blackouts(os.getenv(
     "NEWS_BLACKOUT_UTC", "12:25-12:45,13:55-14:15,18:00-18:20"))
 
@@ -148,6 +150,8 @@ open_positions: List[dict] = []
 pending_makers: Dict[str, dict] = {}      # key → intent
 consumed_fill_ids: set = set()
 lag_cooldown: Dict[str, float] = {c: 0.0 for c in CRYPTOS}
+recent_bursts: Dict[str, List[float]] = {c: [] for c in CRYPTOS}
+_halt_notified: Dict[str, str] = {"day": ""}
 _book_cache: Dict[str, tuple] = {}
 _book_shape_logged: Dict[str, bool] = {}
 tg_app: Optional[Application] = None
@@ -426,6 +430,16 @@ async def purge_expired_makers():
                         f"({intent['filled']}/{intent['count']} filled)")
 
 
+async def maybe_notify_halt(why: str):
+    if "daily loss" not in why:
+        return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _halt_notified["day"] != today:
+        _halt_notified["day"] = today
+        await notify(f"🛑 DAILY LOSS HALT — {why}. No new entries until "
+                     f"UTC midnight. Open positions still managed.")
+
+
 # ── CONVERGENCE strategy ────────────────────────────────────────────────────
 def maker_target_price(p_side: float) -> int:
     """Highest cent price x with p − x − maker_fee(x) ≥ CONV_MIN_EV."""
@@ -460,6 +474,13 @@ async def convergence_loop():
                 if vol.spike_ratio > SPIKE_MAX:
                     store.incr("f_spike")
                     continue          # vol regime unstable → model unreliable
+                now_t = time.time()
+                recent_bursts[crypto] = [
+                    t for t in recent_bursts[crypto]
+                    if now_t - t <= CHOP_WINDOW_S]
+                if len(recent_bursts[crypto]) >= CHOP_MAX_BURSTS:
+                    store.incr("f_chop")
+                    continue          # choppy tape: favorites get run over
                 S = spot.price[crypto]
                 for meta in market_cache[crypto]:
                     tau = meta.tau()
@@ -468,7 +489,7 @@ async def convergence_loop():
                     if has_exposure(meta.ticker):
                         continue
                     store.incr("f_eval")
-                    p_yes = meta.p_yes(S, vol.sigma_1s, TAIL_MULT)
+                    p_yes = meta.p_yes(S, vol.sigma_for_tau(tau), TAIL_MULT)
                     if p_yes >= CONV_MIN_P:
                         side, p_side = "yes", p_yes
                     elif (1 - p_yes) >= CONV_MIN_P:
@@ -479,6 +500,7 @@ async def convergence_loop():
                     ok, why = risk.check(crypto, open_positions)
                     if not ok:
                         store.incr("f_risk")
+                        await maybe_notify_halt(why)
                         logger.debug(f"risk block: {why}")
                         continue
                     book = await get_book(meta.ticker)
@@ -564,6 +586,7 @@ async def lag_loop():
                     continue
                 lag_cooldown[crypto] = now + LAG_COOLDOWN
                 store.incr("f_lag_burst")
+                recent_bursts[crypto].append(now)
                 logger.info(f"⚡ burst {crypto}: {r*100:+.3f}% in {dt:.1f}s "
                             f"(z={z:.1f}) — scanning for lagging quotes")
                 await lag_evaluate(crypto)
@@ -574,11 +597,8 @@ async def lag_loop():
 async def lag_evaluate(crypto: str):
     S = spot.price[crypto]
     vol = spot.vol[crypto]
-    # Price with the SLOW vol estimate: the fast EWMA is contaminated by the
-    # burst that triggered us, which inflates sigma, drags p toward 0.5 and
-    # makes longshots look cheap. The slow baseline prices the post-burst
-    # state the way the market makers do.
-    sigma = vol.sigma_slow
+    # Horizon-matched vol, EXCLUDING the fast EWMA: the burst that triggered
+    # us inflates it, drags p toward 0.5 and makes longshots look cheap.
     best = None
     for meta in market_cache[crypto]:
         tau = meta.tau()
@@ -586,7 +606,8 @@ async def lag_evaluate(crypto: str):
             continue
         if has_exposure(meta.ticker):
             continue
-        p_yes = meta.p_yes(S, sigma, TAIL_MULT)
+        p_yes = meta.p_yes(S, vol.sigma_for_tau(tau, include_fast=False),
+                           TAIL_MULT)
         book = await get_book(meta.ticker, max_age=0.0)   # must be fresh
         if not book:
             continue
@@ -656,8 +677,8 @@ async def try_stop_loss(pos: dict):
         return
     meta = MarketMeta(pos["ticker"], crypto, "", pos["kind"], pos["strike"],
                       pos["close_ts"], {})
-    p_now = meta.p_yes(spot.price[crypto], spot.vol[crypto].sigma_1s,
-                       TAIL_MULT)
+    p_now = meta.p_yes(spot.price[crypto],
+                       spot.vol[crypto].sigma_for_tau(tau), TAIL_MULT)
     p_side = p_now if pos["side"] == "yes" else 1 - p_now
     if p_side >= STOP_P:
         return
@@ -852,7 +873,8 @@ def txt_diag() -> str:
             f"├ divergence guard: {store.get_kv('f_diverge'):.0f}\n"
             f"├ maker: no room to post: {mr:.0f}\n"
             f"└ maker posted: {mp:.0f}\n"
-            f"Vol-spike skips: {sp:.0f} | blackout cycles: {bo:.0f}\n"
+            f"Vol-spike skips: {sp:.0f} | chop skips: "
+            f"{store.get_kv('f_chop'):.0f} | blackout cycles: {bo:.0f}\n"
             f"Lag bursts: {lb:.0f} | stood down: {ls:.0f}\n"
             f"━━━━━━━━━━━━\n"
             f"Best near-miss (since restart):\n{near_miss['txt']}")

@@ -94,6 +94,9 @@ class VolEstimator:
     SIGMA_FLOOR = 2.0e-5    # ≈ 11% annualized
     SIGMA_CAP = 2.0e-3      # ≈ 1120% annualized (chaos guard)
 
+    GRID_S = 10.0          # downsampled price grid step
+    GRID_KEEP = 300        # ≈ 50 minutes of history
+
     def __init__(self):
         prior = (0.55 / math.sqrt(365 * 86400)) ** 2   # ~55% annual vol prior
         self.var_fast = prior
@@ -101,6 +104,8 @@ class VolEstimator:
         self.last_p: Optional[float] = None
         self.last_t: Optional[float] = None
         self.n_ticks = 0
+        self.grid: List[Tuple[float, float]] = []
+        self._hcache: Dict[int, Tuple[float, float]] = {}
 
     def tick(self, t: float, p: float):
         if p <= 0:
@@ -116,6 +121,10 @@ class VolEstimator:
                 self.var_slow = a_s * self.var_slow + (1 - a_s) * sample
                 self.n_ticks += 1
         self.last_p, self.last_t = p, t
+        if not self.grid or t - self.grid[-1][0] >= self.GRID_S:
+            self.grid.append((t, p))
+            if len(self.grid) > self.GRID_KEEP:
+                self.grid.pop(0)
 
     @property
     def sigma_1s(self) -> float:
@@ -130,6 +139,50 @@ class VolEstimator:
     @property
     def spike_ratio(self) -> float:
         return self.sigma_1s / self.sigma_slow if self.sigma_slow > 0 else 1.0
+
+    def _sigma_grid(self, h: float) -> float:
+        """Realized per-√s vol from non-overlapping ~h-second grid returns."""
+        if len(self.grid) < 4:
+            return 0.0
+        now = self.grid[-1][0]
+        hit = self._hcache.get(int(h))
+        if hit and now - hit[0] < 15.0:
+            return hit[1]
+        samples = []
+        j = len(self.grid) - 1
+        while j >= 0 and len(samples) < 24:
+            tj, pj = self.grid[j]
+            k = j
+            while k >= 0 and tj - self.grid[k][0] < h:
+                k -= 1
+            if k < 0:
+                break
+            tk, pk = self.grid[k]
+            dt = tj - tk
+            if dt > 0 and pk > 0 and pj > 0:
+                r = math.log(pj / pk)
+                samples.append(r * r / dt)
+            j = k
+        sig = math.sqrt(sum(samples) / len(samples)) if len(samples) >= 4             else 0.0
+        self._hcache[int(h)] = (now, sig)
+        return sig
+
+    def sigma_for_tau(self, tau: float, include_fast: bool = True) -> float:
+        """Per-√s vol matched to horizon tau: MAX of fast/slow EWMA and
+        directly-measured 60s / 300s realized vol. 1-second wiggle badly
+        underestimates multi-minute movement in trending crypto; taking the
+        max across horizons is the conservative (less overconfident) choice.
+        """
+        cands = [self.sigma_slow]
+        if include_fast:
+            cands.append(self.sigma_1s)
+        for h in (60.0, 300.0):
+            if h <= max(tau, 60.0) * 2.0:
+                s = self._sigma_grid(h)
+                if s > 0:
+                    cands.append(s)
+        s = max(cands)
+        return min(max(s, self.SIGMA_FLOOR), self.SIGMA_CAP)
 
 
 # ────────────────────────────────────────────────────────────────────────────
