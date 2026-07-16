@@ -445,8 +445,8 @@ class Store:
     def summary(self, mode: str) -> dict:
         with self.lock:
             cur = self.db.execute(
-                "SELECT pnl, fee, cost, result, strategy, crypto FROM trades "
-                "WHERE status='closed' AND mode=?", (mode,))
+                "SELECT pnl, fee, cost, result, strategy, crypto, model_p "
+                "FROM trades WHERE status='closed' AND mode=?", (mode,))
             rows = cur.fetchall()
         n = len(rows)
         if not n:
@@ -464,7 +464,7 @@ class Store:
         ci_h = z * math.sqrt(wr * (1 - wr) / n + z * z / (4 * n * n)) / den
         mid = (wr + z * z / (2 * n)) / den
         by_strat, by_crypto = {}, {}
-        for pnl, _f, _c, res, strat, cr in rows:
+        for pnl, _f, _c, res, strat, cr, _mp in rows:
             s = by_strat.setdefault(strat, {"n": 0, "w": 0, "pnl": 0.0})
             s["n"] += 1
             s["w"] += 1 if pnl > 0 else 0
@@ -483,6 +483,8 @@ class Store:
             "sharpe": round(avg / std, 2) if std > 0 else 0.0,
             "avg": round(avg, 3),
             "by_strategy": by_strat, "by_crypto": by_crypto,
+            "model_p_avg": round(
+                sum(r[6] for r in rows) / n * 100, 1),
         }
 
     def daily_pnl(self, mode: str) -> float:

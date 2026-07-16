@@ -91,12 +91,13 @@ BLACKOUTS = parse_blackouts(os.getenv(
     "NEWS_BLACKOUT_UTC", "12:25-12:45,13:55-14:15,18:00-18:20"))
 
 # Convergence strategy
-CONV_MIN_P = float(os.getenv("CONV_MIN_P", "0.965"))
-CONV_MIN_EV = float(os.getenv("CONV_MIN_EV", "0.015"))
+CONV_MIN_P = float(os.getenv("CONV_MIN_P", "0.90"))
+CONV_MIN_EV = float(os.getenv("CONV_MIN_EV", "0.02"))
 CONV_MIN_TAU = float(os.getenv("CONV_MIN_TAU", "45"))
-CONV_MAX_TAU = float(os.getenv("CONV_MAX_TAU", "300"))
-CONV_PRICE_MIN = int(os.getenv("CONV_PRICE_MIN", "78"))
+CONV_MAX_TAU = float(os.getenv("CONV_MAX_TAU", "600"))
+CONV_PRICE_MIN = int(os.getenv("CONV_PRICE_MIN", "72"))
 CONV_PRICE_MAX = int(os.getenv("CONV_PRICE_MAX", "97"))
+MAX_DIVERGENCE = float(os.getenv("MAX_DIVERGENCE", "0.12"))
 CONV_MAKER = os.getenv("CONV_MAKER", "true").lower() == "true"
 MAKER_TTL = float(os.getenv("MAKER_TTL_S", "45"))
 
@@ -452,6 +453,17 @@ async def convergence_loop():
                     _note_near_miss(ev_taker, meta, side, p_side, ask_c,
                                     depth, n)
 
+                    if ask_c >= 99:
+                        store.incr("f_no_offers")
+                        continue      # winning side has no sellers — nothing
+                                      # will trade down to a bid either
+                    if p_side - ask_d > MAX_DIVERGENCE:
+                        store.incr("f_diverge")
+                        logger.info(f"divergence guard: {meta.ticker} {side} "
+                                    f"p={p_side:.3f} vs ask {ask_c}¢ — "
+                                    f"assuming WE are wrong; skipping")
+                        continue
+
                     band_ok = CONV_PRICE_MIN <= ask_c <= CONV_PRICE_MAX
                     if band_ok and ev_taker >= CONV_MIN_EV and n >= MIN_FILL:
                         await execute_taker("conv", meta, side, ask_c, n,
@@ -702,6 +714,8 @@ def txt_pnl() -> str:
             f"P&L: ${s['pnl']:+.2f} | fees ${s['fees']:.2f}\n"
             f"Staked: ${s['staked']:.2f} | ROI {s['roi']}%\n"
             f"Avg/trade ${s['avg']:+.3f} | Sharpe {s['sharpe']}\n"
+            f"🎓 Calibration: model said {s.get('model_p_avg', 0)}% "
+            f"| reality {s['win_rate']}%\n"
             f"Today: ${store.daily_pnl(MODE):+.2f}")
 
 
@@ -759,6 +773,9 @@ def txt_diag() -> str:
             f"{tb:.0f}\n"
             f"├ taker: edge < {CONV_MIN_EV*100:.1f}¢: {te:.0f}\n"
             f"├ taker: depth too thin: {td:.0f}\n"
+            f"├ no offers (ask ≥99¢): "
+            f"{store.get_kv('f_no_offers'):.0f}\n"
+            f"├ divergence guard: {store.get_kv('f_diverge'):.0f}\n"
             f"├ maker: no room to post: {mr:.0f}\n"
             f"└ maker posted: {mp:.0f}\n"
             f"Vol-spike skips: {sp:.0f} | blackout cycles: {bo:.0f}\n"
