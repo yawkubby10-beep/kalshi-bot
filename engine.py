@@ -265,22 +265,34 @@ class SpotFeed:
 
 def parse_book(raw: dict) -> dict:
     book = raw.get("orderbook", raw) or {}
+    fp = (raw.get("orderbook_fp") or book.get("orderbook_fp")
+          or (book if "yes_dollars" in book else {}) or {})
 
-    def norm(levels) -> List[Tuple[int, int]]:
+    def norm(levels, dollars: bool = False) -> List[Tuple[int, int]]:
         out = []
         for lv in levels or []:
             try:
                 if isinstance(lv, (list, tuple)) and len(lv) >= 2:
-                    out.append((int(lv[0]), int(lv[1])))
+                    p, c = float(lv[0]), float(lv[1])
                 elif isinstance(lv, dict):
-                    out.append((int(lv.get("price", 0)),
-                                int(lv.get("quantity", lv.get("count", 0)))))
+                    p = float(lv.get("price", 0))
+                    c = float(lv.get("quantity", lv.get("count", 0)))
+                else:
+                    continue
+                if dollars or (0 < p < 1.0):
+                    p = p * 100.0
+                out.append((int(round(p)), int(c)))
             except (TypeError, ValueError):
                 continue
         return out
 
     yes_bids = sorted(norm(book.get("yes")), key=lambda x: -x[0])
     no_bids = sorted(norm(book.get("no")), key=lambda x: -x[0])
+    if not yes_bids and not no_bids and fp:
+        yes_bids = sorted(norm(fp.get("yes_dollars") or fp.get("yes"),
+                               dollars=True), key=lambda x: -x[0])
+        no_bids = sorted(norm(fp.get("no_dollars") or fp.get("no"),
+                              dollars=True), key=lambda x: -x[0])
 
     # Ask ladders (ascending price) derived from opposite-side bids
     yes_asks = sorted([(100 - p, c) for p, c in no_bids], key=lambda x: x[0])
@@ -322,6 +334,13 @@ def walk_book(ask_ladder: List[Tuple[int, int]], limit_c: int,
 _NUM_RE = re.compile(r"\$?([\d,]+(?:\.\d+)?)")
 
 
+# Kalshi crypto markets settle on a 60-second AVERAGE of the CF Benchmarks
+# Real-Time Index (sampled 1/s over the final minute). The variance of that
+# average equals the variance of a point price ~40s earlier, so the effective
+# diffusion horizon is tau − 40s.
+SETTLE_TWAP_ADJUST_S = float(os.getenv("SETTLE_TWAP_ADJUST_S", "40"))
+
+
 class MarketMeta:
     __slots__ = ("ticker", "crypto", "series", "kind", "strike",
                  "close_ts", "raw")
@@ -340,7 +359,8 @@ class MarketMeta:
 
     def p_yes(self, spot: float, sigma_1s: float, tail: float,
               now: Optional[float] = None) -> float:
-        p_above = fair_prob_above(spot, self.strike, self.tau(now),
+        tau_eff = max(self.tau(now) - SETTLE_TWAP_ADJUST_S, 1.0)
+        p_above = fair_prob_above(spot, self.strike, tau_eff,
                                   sigma_1s, tail)
         return p_above if self.kind == "above" else 1.0 - p_above
 

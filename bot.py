@@ -75,7 +75,15 @@ MODE = "paper" if PAPER_MODE else "live"
 CRYPTOS = [c.strip().upper() for c in
            os.getenv("CRYPTOS", "BTC,ETH,SOL").split(",") if c.strip()]
 SERIES_15M = {c: f"KX{c}15M" for c in CRYPTOS}
-SERIES_1H = {c: f"KX{c}1H" for c in CRYPTOS}
+# Hourly above/below series: KXBTCD family (NOT KX{c}1H — that returns nothing)
+_HOURLY_DEFAULT = {"BTC": "KXBTCD", "ETH": "KXETHD", "SOL": "KXSOLD"}
+SERIES_1H = {}
+for _pair in os.getenv("SERIES_1H_MAP", "").split(","):
+    if ":" in _pair:
+        _k, _v = _pair.split(":", 1)
+        SERIES_1H[_k.strip().upper()] = _v.strip().upper()
+for _c in CRYPTOS:
+    SERIES_1H.setdefault(_c, _HOURLY_DEFAULT.get(_c, f"KX{_c}D"))
 BASE = "https://api.elections.kalshi.com"
 
 # Sizing / risk
@@ -138,6 +146,7 @@ pending_makers: Dict[str, dict] = {}      # key → intent
 consumed_fill_ids: set = set()
 lag_cooldown: Dict[str, float] = {c: 0.0 for c in CRYPTOS}
 _book_cache: Dict[str, tuple] = {}
+_book_shape_logged: Dict[str, bool] = {}
 tg_app: Optional[Application] = None
 
 
@@ -165,6 +174,15 @@ async def get_book(ticker: str, max_age: float = 1.5) -> Optional[dict]:
         raw = await fetch_json(f"/trade-api/v2/markets/{ticker}/orderbook",
                                {"depth": 16})
         parsed = parse_book(raw)
+        if not _book_shape_logged.get("done"):
+            _book_shape_logged["done"] = True
+            inner = raw.get("orderbook") or {}
+            logger.info(
+                f"first book {ticker}: keys={list(raw.keys())} "
+                f"inner={list(inner.keys()) if isinstance(inner, dict) else '?'} "
+                f"→ yes {parsed['yes_bid']}/{parsed['yes_ask']} "
+                f"no {parsed['no_bid']}/{parsed['no_ask']} "
+                f"levels y{len(parsed['yes_bids'])}/n{len(parsed['no_bids'])}")
         _book_cache[ticker] = (now, parsed)
         return parsed
     except Exception as e:
@@ -172,22 +190,35 @@ async def get_book(ticker: str, max_age: float = 1.5) -> Optional[dict]:
         return None
 
 
+_series_note: Dict[str, bool] = {}
+
+
 async def market_refresh_loop():
     while True:
         for crypto in CRYPTOS:
             metas: List[MarketMeta] = []
             for series in (SERIES_15M[crypto], SERIES_1H[crypto]):
+                got, priced = 0, 0
                 try:
                     data = await fetch_json(
                         "/trade-api/v2/markets",
                         {"limit": 8, "status": "open",
                          "series_ticker": series})
-                    for m in data.get("markets", []) or []:
+                    mkts = data.get("markets", []) or []
+                    got = len(mkts)
+                    for m in mkts:
                         meta = parse_market(m, crypto, series)
                         if meta and 0 < meta.tau() < 7200:
                             metas.append(meta)
+                            priced += 1
                 except Exception as e:
                     logger.debug(f"market refresh {series}: {e}")
+                if series not in _series_note:
+                    _series_note[series] = True
+                    lvl = logger.info if got else logger.warning
+                    lvl(f"series {series}: {got} open markets, "
+                        f"{priced} priced"
+                        + ("" if got else " — CHECK SERIES TICKER"))
             metas.sort(key=lambda x: x.close_ts)
             market_cache[crypto] = metas
         await asyncio.sleep(20)
