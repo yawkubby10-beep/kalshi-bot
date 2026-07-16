@@ -596,6 +596,8 @@ class PaperBroker:
         self.makers: Dict[str, PaperMakerOrder] = {}
         self._last_trade_ts: Dict[str, str] = {}
         self.on_maker_fill: Optional[Callable] = None
+        self.poll_ok = 0
+        self.poll_err = 0
 
     # taker: caller supplies a freshly fetched parsed book
     @staticmethod
@@ -632,8 +634,14 @@ class PaperBroker:
                     params={"ticker": ticker, "limit": 100},
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
+                    if r.status != 200:
+                        self.poll_err += 1
+                        logger.warning(f"trade tape {ticker} HTTP {r.status}")
+                        continue
                     data = await r.json()
+                    self.poll_ok += 1
             except Exception as e:
+                self.poll_err += 1
                 logger.debug(f"paper trades poll error {ticker}: {e}")
                 continue
             trades = data.get("trades", []) or []

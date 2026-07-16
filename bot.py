@@ -98,7 +98,7 @@ CONV_MAX_TAU = float(os.getenv("CONV_MAX_TAU", "300"))
 CONV_PRICE_MIN = int(os.getenv("CONV_PRICE_MIN", "78"))
 CONV_PRICE_MAX = int(os.getenv("CONV_PRICE_MAX", "97"))
 CONV_MAKER = os.getenv("CONV_MAKER", "true").lower() == "true"
-MAKER_TTL = float(os.getenv("MAKER_TTL_S", "20"))
+MAKER_TTL = float(os.getenv("MAKER_TTL_S", "45"))
 
 # Lag strategy
 LAG_ENABLED = os.getenv("LAG_ENABLED", "true").lower() == "true"
@@ -394,17 +394,30 @@ def maker_target_price(p_side: float) -> int:
     return int(math.floor(x * 100))
 
 
+near_miss = {"ev": -9.9, "txt": "none yet"}
+
+
+def _note_near_miss(ev, meta, side, p, ask_c, depth, n):
+    if ev > near_miss["ev"]:
+        near_miss["ev"] = ev
+        near_miss["txt"] = (f"{meta.crypto} {side}@{ask_c}¢ p={p:.3f} "
+                            f"ev={ev*100:+.1f}¢ depth={depth} size={n} "
+                            f"τ={meta.tau():.0f}s")
+
+
 async def convergence_loop():
     while True:
         await asyncio.sleep(2.0)
         try:
             if in_blackout(BLACKOUTS):
+                store.incr("f_blackout_cycles")
                 continue
             for crypto in CRYPTOS:
                 if not spot.ready(crypto):
                     continue
                 vol = spot.vol[crypto]
                 if vol.spike_ratio > SPIKE_MAX:
+                    store.incr("f_spike")
                     continue          # vol regime unstable → model unreliable
                 S = spot.price[crypto]
                 for meta in market_cache[crypto]:
@@ -413,15 +426,18 @@ async def convergence_loop():
                         continue
                     if has_exposure(meta.ticker):
                         continue
+                    store.incr("f_eval")
                     p_yes = meta.p_yes(S, vol.sigma_1s, TAIL_MULT)
                     if p_yes >= CONV_MIN_P:
                         side, p_side = "yes", p_yes
                     elif (1 - p_yes) >= CONV_MIN_P:
                         side, p_side = "no", 1 - p_yes
                     else:
+                        store.incr("f_p_fail")
                         continue
                     ok, why = risk.check(crypto, open_positions)
                     if not ok:
+                        store.incr("f_risk")
                         logger.debug(f"risk block: {why}")
                         continue
                     book = await get_book(meta.ticker)
@@ -433,12 +449,24 @@ async def convergence_loop():
                     ev_taker = p_side - ask_d - taker_fee_pc(ask_d)
                     depth = depth_at(ladder, ask_c)
                     n = sized(ask_c, depth, MAX_STAKE_USD)
+                    _note_near_miss(ev_taker, meta, side, p_side, ask_c,
+                                    depth, n)
 
-                    if (CONV_PRICE_MIN <= ask_c <= CONV_PRICE_MAX
-                            and ev_taker >= CONV_MIN_EV and n >= MIN_FILL):
+                    band_ok = CONV_PRICE_MIN <= ask_c <= CONV_PRICE_MAX
+                    if band_ok and ev_taker >= CONV_MIN_EV and n >= MIN_FILL:
                         await execute_taker("conv", meta, side, ask_c, n,
                                             p_side, book)
                         continue
+                    # why did taker not fire? (funnel)
+                    if not band_ok:
+                        store.incr("f_t_band")
+                    elif ev_taker < CONV_MIN_EV:
+                        store.incr("f_t_ev")
+                    elif n < MIN_FILL:
+                        store.incr("f_t_depth")
+                        logger.info(f"depth-blocked: {meta.ticker} {side} "
+                                    f"ask={ask_c}¢ depth={depth} → size {n} "
+                                    f"< {MIN_FILL}")
 
                     if not CONV_MAKER:
                         continue
@@ -446,13 +474,16 @@ async def convergence_loop():
                     tgt = min(tgt, ask_c - 1, CONV_PRICE_MAX)
                     bid_c = book[f"{side}_bid"]
                     if tgt < max(CONV_PRICE_MIN, bid_c) or tgt < 1:
+                        store.incr("f_m_room")
                         continue      # our price wouldn't be top-of-book
                     ttl = min(MAKER_TTL, tau - (STOP_MIN_TAU - 5))
                     if ttl < 6:
+                        store.incr("f_m_room")
                         continue
                     n_m = min(MAX_CONTRACTS,
                               int(MAX_STAKE_USD / (tgt / 100.0)))
                     if n_m < MIN_FILL:
+                        store.incr("f_m_room")
                         continue
                     await place_maker(meta, side, tgt, n_m, p_side, ttl)
         except Exception:
@@ -480,6 +511,7 @@ async def lag_loop():
                 if z < LAG_Z or abs(r) < LAG_MIN_MOVE:
                     continue
                 lag_cooldown[crypto] = now + LAG_COOLDOWN
+                store.incr("f_lag_burst")
                 logger.info(f"⚡ burst {crypto}: {r*100:+.3f}% in {dt:.1f}s "
                             f"(z={z:.1f}) — scanning for lagging quotes")
                 await lag_evaluate(crypto)
@@ -516,6 +548,7 @@ async def lag_evaluate(crypto: str):
             if best is None or ev > best[0]:
                 best = (ev, meta, side, ask_c, n, p_side, book)
     if not best:
+        store.incr("f_lag_standdown")
         logger.info(f"{crypto}: burst but no lagging quotes (MMs already "
                     f"repriced) — correctly standing down")
         return
@@ -653,6 +686,7 @@ def panel():
          InlineKeyboardButton("🎯 Fill stats", callback_data="fills")],
         [InlineKeyboardButton("💰 Balance", callback_data="bal"),
          InlineKeyboardButton("🔧 Settings", callback_data="cfg")],
+        [InlineKeyboardButton("🔬 Why no trades?", callback_data="diag")],
         [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
          InlineKeyboardButton("▶️ Resume", callback_data="resume")],
     ])
@@ -698,9 +732,39 @@ def txt_fills() -> str:
             f"({mr:.0f}%)\n"
             f"Taker: {ta:.0f} sent | {tfc:.0f}/{trc:.0f} contracts "
             f"({tr:.0f}%)\n"
-            f"Pending makers: {len(pending_makers)}\n\n"
+            f"Pending makers: {len(pending_makers)}\n"
+            f"Tape polls: {paper.poll_ok} ok / {paper.poll_err} err\n\n"
             f"These are REAL fill rates — the number paper mode\n"
             f"used to lie to you about.")
+
+
+def txt_diag() -> str:
+    ev = store.get_kv("f_eval")
+    pf = store.get_kv("f_p_fail")
+    rk = store.get_kv("f_risk")
+    tb = store.get_kv("f_t_band")
+    te = store.get_kv("f_t_ev")
+    td = store.get_kv("f_t_depth")
+    mr = store.get_kv("f_m_room")
+    mp = store.get_kv("maker_placed")
+    sp = store.get_kv("f_spike")
+    bo = store.get_kv("f_blackout_cycles")
+    lb = store.get_kv("f_lag_burst")
+    ls = store.get_kv("f_lag_standdown")
+    return (f"🔬 Signal funnel [{MODE.upper()}]\n━━━━━━━━━━━━\n"
+            f"Windows evaluated: {ev:.0f}\n"
+            f"├ no {CONV_MIN_P:.0%}+ favorite: {pf:.0f}\n"
+            f"├ risk-blocked: {rk:.0f}\n"
+            f"├ taker: ask outside {CONV_PRICE_MIN}–{CONV_PRICE_MAX}¢: "
+            f"{tb:.0f}\n"
+            f"├ taker: edge < {CONV_MIN_EV*100:.1f}¢: {te:.0f}\n"
+            f"├ taker: depth too thin: {td:.0f}\n"
+            f"├ maker: no room to post: {mr:.0f}\n"
+            f"└ maker posted: {mp:.0f}\n"
+            f"Vol-spike skips: {sp:.0f} | blackout cycles: {bo:.0f}\n"
+            f"Lag bursts: {lb:.0f} | stood down: {ls:.0f}\n"
+            f"━━━━━━━━━━━━\n"
+            f"Best near-miss (since restart):\n{near_miss['txt']}")
 
 
 def txt_cfg() -> str:
@@ -760,6 +824,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("\n".join(lines))
     elif d == "fills":
         await q.edit_message_text(txt_fills())
+    elif d == "diag":
+        await q.edit_message_text(txt_diag())
     elif d == "bal":
         if PAPER_MODE:
             s = store.summary(MODE)
