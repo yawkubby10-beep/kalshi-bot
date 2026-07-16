@@ -264,35 +264,69 @@ class SpotFeed:
 # ────────────────────────────────────────────────────────────────────────────
 
 def parse_book(raw: dict) -> dict:
-    book = raw.get("orderbook", raw) or {}
-    fp = (raw.get("orderbook_fp") or book.get("orderbook_fp")
-          or (book if "yes_dollars" in book else {}) or {})
+    """Parse a Kalshi orderbook (fp-first).
 
-    def norm(levels, dollars: bool = False) -> List[Tuple[int, int]]:
-        out = []
+    Canonical format (docs.kalshi.com): {"orderbook_fp": {"yes_dollars":
+    [[price_dollars, count_fp], ...], "no_dollars": [...]}} — BOTH arrays are
+    BIDS (the API never returns asks; they're derived from the other side).
+    Prices may be sub-penny (e.g. "0.995"). We floor bids to whole cents
+    (conservative: a 99.5¢ bid is treated as 99¢) and merge levels.
+    Legacy cents format is still accepted as a fallback.
+    """
+    outer = raw or {}
+    legacy = outer.get("orderbook") if isinstance(
+        outer.get("orderbook"), dict) else {}
+    fp = outer.get("orderbook_fp") or (legacy or {}).get("orderbook_fp") or {}
+
+    def _emit(acc: dict, p_cents_f: float, c: int):
+        pc = int(math.floor(p_cents_f + 1e-9))
+        if 1 <= pc <= 99 and c > 0:
+            acc[pc] = acc.get(pc, 0) + c
+
+    def norm_fp(levels) -> List[Tuple[int, int]]:
+        acc: dict = {}
         for lv in levels or []:
             try:
                 if isinstance(lv, (list, tuple)) and len(lv) >= 2:
-                    p, c = float(lv[0]), float(lv[1])
+                    p_d, c = float(lv[0]), int(float(lv[1]))
                 elif isinstance(lv, dict):
-                    p = float(lv.get("price", 0))
-                    c = float(lv.get("quantity", lv.get("count", 0)))
+                    p_d = float(lv.get("price",
+                                       lv.get("price_dollars", 0)))
+                    c = int(float(lv.get("quantity",
+                                         lv.get("count",
+                                                lv.get("count_fp", 0)))))
                 else:
                     continue
-                if dollars or (0 < p < 1.0):
-                    p = p * 100.0
-                out.append((int(round(p)), int(c)))
+                _emit(acc, p_d * 100.0, c)
             except (TypeError, ValueError):
                 continue
-        return out
+        return sorted(acc.items(), key=lambda x: -x[0])
 
-    yes_bids = sorted(norm(book.get("yes")), key=lambda x: -x[0])
-    no_bids = sorted(norm(book.get("no")), key=lambda x: -x[0])
-    if not yes_bids and not no_bids and fp:
-        yes_bids = sorted(norm(fp.get("yes_dollars") or fp.get("yes"),
-                               dollars=True), key=lambda x: -x[0])
-        no_bids = sorted(norm(fp.get("no_dollars") or fp.get("no"),
-                              dollars=True), key=lambda x: -x[0])
+    def norm_legacy(levels) -> List[Tuple[int, int]]:
+        acc: dict = {}
+        for lv in levels or []:
+            try:
+                if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+                    p, c = float(lv[0]), int(float(lv[1]))
+                elif isinstance(lv, dict):
+                    p = float(lv.get("price", 0))
+                    c = int(float(lv.get("quantity", lv.get("count", 0))))
+                else:
+                    continue
+                _emit(acc, p * 100.0 if 0 < p < 1.0 else p, c)
+            except (TypeError, ValueError):
+                continue
+        return sorted(acc.items(), key=lambda x: -x[0])
+
+    if fp and (fp.get("yes_dollars") or fp.get("no_dollars")):
+        yes_bids = norm_fp(fp.get("yes_dollars"))
+        no_bids = norm_fp(fp.get("no_dollars"))
+    else:
+        yes_bids = norm_legacy((legacy or {}).get("yes"))
+        no_bids = norm_legacy((legacy or {}).get("no"))
+        if not yes_bids and not no_bids and fp:
+            yes_bids = norm_fp(fp.get("yes"))
+            no_bids = norm_fp(fp.get("no"))
 
     # Ask ladders (ascending price) derived from opposite-side bids
     yes_asks = sorted([(100 - p, c) for p, c in no_bids], key=lambda x: x[0])

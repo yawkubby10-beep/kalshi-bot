@@ -176,10 +176,12 @@ async def get_book(ticker: str, max_age: float = 1.5) -> Optional[dict]:
         parsed = parse_book(raw)
         if not _book_shape_logged.get("done"):
             _book_shape_logged["done"] = True
-            inner = raw.get("orderbook") or {}
+            fp = raw.get("orderbook_fp") or {}
+            ys = (fp.get("yes_dollars") or [None])[0]
+            ns = (fp.get("no_dollars") or [None])[0]
             logger.info(
                 f"first book {ticker}: keys={list(raw.keys())} "
-                f"inner={list(inner.keys()) if isinstance(inner, dict) else '?'} "
+                f"sample yes0={ys} no0={ns} "
                 f"→ yes {parsed['yes_bid']}/{parsed['yes_ask']} "
                 f"no {parsed['no_bid']}/{parsed['no_ask']} "
                 f"levels y{len(parsed['yes_bids'])}/n{len(parsed['no_bids'])}")
