@@ -119,6 +119,9 @@ LAG_Z = float(os.getenv("LAG_Z", "3.0"))
 LAG_LOOKBACK = float(os.getenv("LAG_LOOKBACK_S", "8"))
 LAG_MIN_MOVE = float(os.getenv("LAG_MIN_MOVE", "0.0008"))
 LAG_MIN_EV = float(os.getenv("LAG_MIN_EV", "0.04"))
+LAG_MIN_P = float(os.getenv("LAG_MIN_P", "0.55"))   # only trade the side the
+# model favors — never longshots (they only look cheap because the burst
+# inflated the fast vol estimate), and never below the stop-loss threshold
 LAG_MIN_TAU = float(os.getenv("LAG_MIN_TAU", "90"))
 LAG_MAX_TAU = float(os.getenv("LAG_MAX_TAU", "900"))
 LAG_COOLDOWN = float(os.getenv("LAG_COOLDOWN_S", "60"))
@@ -571,6 +574,11 @@ async def lag_loop():
 async def lag_evaluate(crypto: str):
     S = spot.price[crypto]
     vol = spot.vol[crypto]
+    # Price with the SLOW vol estimate: the fast EWMA is contaminated by the
+    # burst that triggered us, which inflates sigma, drags p toward 0.5 and
+    # makes longshots look cheap. The slow baseline prices the post-burst
+    # state the way the market makers do.
+    sigma = vol.sigma_slow
     best = None
     for meta in market_cache[crypto]:
         tau = meta.tau()
@@ -578,15 +586,23 @@ async def lag_evaluate(crypto: str):
             continue
         if has_exposure(meta.ticker):
             continue
-        p_yes = meta.p_yes(S, vol.sigma_1s, TAIL_MULT)
+        p_yes = meta.p_yes(S, sigma, TAIL_MULT)
         book = await get_book(meta.ticker, max_age=0.0)   # must be fresh
         if not book:
             continue
         for side, p_side in (("yes", p_yes), ("no", 1 - p_yes)):
+            if p_side < LAG_MIN_P:
+                continue          # entry must clear the stop threshold + favor
             ask_c = book[f"{side}_ask"]
             if not (5 <= ask_c <= 95):
                 continue
             ask_d = ask_c / 100.0
+            if p_side - ask_d > MAX_DIVERGENCE:
+                store.incr("f_diverge")
+                logger.info(f"lag divergence guard: {meta.ticker} {side} "
+                            f"p={p_side:.3f} vs ask {ask_c}¢ — assuming WE "
+                            f"are wrong; skipping")
+                continue
             ev = p_side - ask_d - taker_fee_pc(ask_d)
             if ev < LAG_MIN_EV:
                 continue
@@ -848,7 +864,7 @@ def txt_cfg() -> str:
             f"τ∈[{CONV_MIN_TAU:.0f},{CONV_MAX_TAU:.0f}]s "
             f"px∈[{CONV_PRICE_MIN},{CONV_PRICE_MAX}]¢ "
             f"maker={'on' if CONV_MAKER else 'off'} ttl={MAKER_TTL:.0f}s\n"
-            f"LAG: z≥{LAG_Z} ev≥{LAG_MIN_EV*100:.0f}¢ "
+            f"LAG: z≥{LAG_Z} p≥{LAG_MIN_P} ev≥{LAG_MIN_EV*100:.0f}¢ "
             f"τ∈[{LAG_MIN_TAU:.0f},{LAG_MAX_TAU:.0f}]s "
             f"{'on' if LAG_ENABLED else 'off'}\n"
             f"Size: ≤{MAX_CONTRACTS}c ≤${MAX_STAKE_USD:.0f} "
