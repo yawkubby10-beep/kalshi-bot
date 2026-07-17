@@ -793,7 +793,8 @@ def panel():
          InlineKeyboardButton("🎯 Fill stats", callback_data="fills")],
         [InlineKeyboardButton("💰 Balance", callback_data="bal"),
          InlineKeyboardButton("🔧 Settings", callback_data="cfg")],
-        [InlineKeyboardButton("🔬 Why no trades?", callback_data="diag")],
+        [InlineKeyboardButton("🔬 Why no trades?", callback_data="diag"),
+         InlineKeyboardButton("♻️ Reset calib", callback_data="calibreset")],
         [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
          InlineKeyboardButton("▶️ Resume", callback_data="resume")],
     ])
@@ -811,7 +812,22 @@ def txt_pnl() -> str:
             f"Avg/trade ${s['avg']:+.3f} | Sharpe {s['sharpe']}\n"
             f"🎓 Calibration: model said {s.get('model_p_avg', 0)}% "
             f"| reality {s['win_rate']}%\n"
-            f"Today: ${store.daily_pnl(MODE):+.2f}")
+            f"Today: ${store.daily_pnl(MODE):+.2f}"
+            + _calib_window_txt())
+
+
+def _calib_window_txt() -> str:
+    rt = store.get_kv("calib_since")
+    if rt <= 0:
+        return ""
+    s2 = store.summary(MODE, rt)
+    if not s2.get("trades"):
+        return "\n— since calib reset: no closed trades yet —"
+    return (f"\n— since calib reset ({s2['trades']}T) —\n"
+            f"WR {s2['win_rate']}% ({s2['wr_ci']}) | "
+            f"P&L ${s2['pnl']:+.2f}\n"
+            f"🎓 model {s2.get('model_p_avg', 0)}% vs real "
+            f"{s2['win_rate']}%")
 
 
 def txt_strat() -> str:
@@ -939,6 +955,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(txt_fills())
     elif d == "diag":
         await q.edit_message_text(txt_diag())
+    elif d == "calibreset":
+        store.set_kv("calib_since", time.time())
+        await q.edit_message_text(
+            "♻️ Calibration window reset. The P&L panel now shows a clean "
+            "'since reset' block — only trades from this moment forward. "
+            "All-time stats are preserved above it.")
     elif d == "bal":
         if PAPER_MODE:
             s = store.summary(MODE)

@@ -549,11 +549,12 @@ class Store:
                     "tau", "close_ts", "kind", "strike"]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    def summary(self, mode: str) -> dict:
+    def summary(self, mode: str, since_ts: float = 0.0) -> dict:
         with self.lock:
             cur = self.db.execute(
                 "SELECT pnl, fee, cost, result, strategy, crypto, model_p "
-                "FROM trades WHERE status='closed' AND mode=?", (mode,))
+                "FROM trades WHERE status='closed' AND mode=? AND ts>=?",
+                (mode, since_ts))
             rows = cur.fetchall()
         n = len(rows)
         if not n:
@@ -602,6 +603,13 @@ class Store:
                 "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='closed' "
                 "AND mode=? AND ts>=?", (mode, day0))
             return float(cur.fetchone()[0] or 0.0)
+
+    def set_kv(self, key: str, val: float):
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO kv(k,v) VALUES(?,?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, val))
+            self.db.commit()
 
     def incr(self, key: str, by: float = 1.0):
         with self.lock:
