@@ -155,6 +155,7 @@ _halt_notified: Dict[str, str] = {"day": ""}
 _book_cache: Dict[str, tuple] = {}
 _book_shape_logged: Dict[str, bool] = {}
 tg_app: Optional[Application] = None
+arb = None   # ArbScanner, built in on_startup
 
 
 async def notify(text: str):
@@ -795,6 +796,7 @@ def panel():
          InlineKeyboardButton("🔧 Settings", callback_data="cfg")],
         [InlineKeyboardButton("🔬 Why no trades?", callback_data="diag"),
          InlineKeyboardButton("♻️ Reset calib", callback_data="calibreset")],
+        [InlineKeyboardButton("🔀 Arb scanner", callback_data="arb")],
         [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
          InlineKeyboardButton("▶️ Resume", callback_data="resume")],
     ])
@@ -921,6 +923,42 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Convergence + Lag | {', '.join(CRYPTOS)}", reply_markup=panel())
 
 
+async def cmd_arb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER:
+        return
+    await update.message.reply_text(
+        arb.txt_status() if arb else "Arb scanner not started yet.")
+
+
+async def cmd_arbpairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER or not arb:
+        return
+    rows = arb.pending_pairs()
+    if not rows:
+        await update.message.reply_text(
+            "No pending pairs. New candidates are nominated automatically "
+            "as matching markets appear.")
+        return
+    for r in rows:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ approve", callback_data=f"arbok:{r['id']}"),
+            InlineKeyboardButton("🚫 reject", callback_data=f"arbno:{r['id']}"),
+        ]])
+        await update.message.reply_text(
+            f"#{r['id']} (match {r['score']:.0%})\n"
+            f"KALSHI: {r['k_title']}\n  ticker {r['k_ticker']}\n"
+            f"POLY:   {r['pm_title']}\n  slug {r['pm_slug']}\n"
+            f"⚠️ approve ONLY after reading both rule pages — resolution "
+            f"mismatch is the one real risk.", reply_markup=kb)
+
+
+async def cmd_arblog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER:
+        return
+    await update.message.reply_text(
+        arb.txt_log() if arb else "Arb scanner not started yet.")
+
+
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER:
         return
@@ -955,6 +993,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(txt_fills())
     elif d == "diag":
         await q.edit_message_text(txt_diag())
+    elif d == "arb":
+        await q.edit_message_text(
+            arb.txt_status() if arb else "Arb scanner not started yet.")
+    elif d.startswith("arbok:") or d.startswith("arbno:"):
+        pid = int(d.split(":")[1])
+        ok = (arb.approve(pid) if d.startswith("arbok:")
+              else arb.reject(pid)) if arb else False
+        await q.edit_message_text(
+            (f"✅ pair #{pid} approved — executable-lock checks begin on "
+             f"the next cycle." if d.startswith("arbok:") else
+             f"🚫 pair #{pid} rejected.") if ok
+            else f"pair #{pid} not pending (already handled?).")
     elif d == "calibreset":
         store.set_kv("calib_since", time.time())
         await q.edit_message_text(
@@ -1029,6 +1079,13 @@ async def on_startup(app: Application):
     asyncio.create_task(paper_maker_poll_loop())
     asyncio.create_task(heartbeat_loop())
 
+    global arb
+    from arb_scanner import ArbScanner
+    arb_db = os.path.join(os.path.dirname(DB_PATH) or "/tmp", "arb.db")
+    arb = ArbScanner(arb_db, client, lambda: http, notify)
+    asyncio.create_task(arb.universe_loop())
+    asyncio.create_task(arb.books_loop())
+
     await notify(
         f"🤖 Kalshi Bot v3 STARTED [{MODE.upper()}]\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -1041,7 +1098,9 @@ async def on_startup(app: Application):
         f"━━━━━━━━━━━━━━━━\n"
         f"⚠️ v3 trades much less often than v2 — that is the point.\n"
         f"Every skipped trade is a bad fill you're not paying for.\n"
-        f"Fills, fees and paper results are now real. /start for panel."
+        f"Fills, fees and paper results are now real. /start for panel.\n"
+        f"🔀 Arb scanner ON (read-only): nominating Kalshi⇄Polymarket "
+        f"pairs for your approval; logging fee-adjusted executable locks."
         + (f"\n\n♻️ Restored {len(open_positions)} open position(s)."
            if open_positions else ""))
 
@@ -1051,6 +1110,9 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("arb", cmd_arb))
+    app.add_handler(CommandHandler("arbpairs", cmd_arbpairs))
+    app.add_handler(CommandHandler("arblog", cmd_arblog))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_tg_error)
     app.post_init = on_startup
