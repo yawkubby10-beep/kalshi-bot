@@ -1082,7 +1082,7 @@ async def on_startup(app: Application):
     global arb
     from arb_scanner import ArbScanner
     arb_db = os.path.join(os.path.dirname(DB_PATH) or "/tmp", "arb.db")
-    arb = ArbScanner(arb_db, client, lambda: http, notify)
+    arb = ArbScanner(arb_db, lambda: http, notify)
     asyncio.create_task(arb.universe_loop())
     asyncio.create_task(arb.books_loop())
 

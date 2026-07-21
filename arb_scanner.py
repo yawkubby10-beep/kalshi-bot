@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK = "https://clob.polymarket.com/book"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 ARB_MIN_EDGE = float(os.getenv("ARB_MIN_EDGE", "0.010"))      # log at ≥1%
 ARB_ALERT_EDGE = float(os.getenv("ARB_ALERT_EDGE", "0.020"))  # ping at ≥2%
@@ -203,8 +204,11 @@ def parse_pm_book(raw: dict) -> Optional[dict]:
 # ── the scanner ──────────────────────────────────────────────────────────
 
 class ArbScanner:
-    def __init__(self, db_path: str, kalshi_client, session_getter,
-                 notify_fn):
+    def __init__(self, db_path: str, session_getter, notify_fn,
+                 kalshi_client=None):
+        # Kalshi market data is PUBLIC — no auth needed for the scanner.
+        # (Paper-mode kalshi-bot has been reading it authless all along;
+        # the authed client stays optional for a future execution phase.)
         self.kc = kalshi_client
         self._sess = session_getter
         self.notify = notify_fn
@@ -238,7 +242,7 @@ class ArbScanner:
             await asyncio.sleep(UNIVERSE_INTERVAL)
 
     async def _refresh_universe(self):
-        k_markets = await asyncio.to_thread(self._kalshi_universe)
+        k_markets = await self._kalshi_universe()
         pm_markets = await self._pm_universe()
         self.stats.update(k_markets=len(k_markets),
                           pm_markets=len(pm_markets),
@@ -288,13 +292,23 @@ class ArbScanner:
         if new:
             logger.info(f"arb: {new} new candidate pair(s)")
 
-    def _kalshi_universe(self) -> List[dict]:
+    async def _kalshi_universe(self) -> List[dict]:
         out, cursor = [], None
+        sess = self._sess()
         for _ in range(8):
             params = {"status": "open", "limit": 500}
             if cursor:
                 params["cursor"] = cursor
-            resp = self.kc._req("GET", "/markets", params)
+            try:
+                async with sess.get(f"{KALSHI_BASE}/markets", params=params,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        logger.warning(f"kalshi markets HTTP {r.status}")
+                        break
+                    resp = await r.json()
+            except Exception as e:
+                logger.debug(f"kalshi universe: {e}")
+                break
             for m in resp.get("markets", []):
                 try:
                     if float(m.get("volume") or 0) < 50:
@@ -307,6 +321,19 @@ class ArbScanner:
             if not cursor:
                 break
         return out
+
+    async def _kalshi_orderbook(self, ticker: str) -> Optional[dict]:
+        sess = self._sess()
+        try:
+            async with sess.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook",
+                                params={"depth": 16},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                return await r.json()
+        except Exception as e:
+            logger.debug(f"kalshi book {ticker}: {e}")
+            return None
 
     async def _pm_universe(self) -> List[dict]:
         out = []
@@ -361,11 +388,8 @@ class ArbScanner:
             await asyncio.sleep(BOOK_INTERVAL)
 
     async def _check_pair(self, p):
-        try:
-            raw_k = await asyncio.to_thread(self.kc.get_orderbook,
-                                            p["k_ticker"])
-        except Exception as e:
-            logger.debug(f"kalshi book {p['k_ticker']}: {e}")
+        raw_k = await self._kalshi_orderbook(p["k_ticker"])
+        if raw_k is None:
             return
         kb = parse_kalshi_book(raw_k)
         if not kb:
