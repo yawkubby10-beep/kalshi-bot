@@ -368,10 +368,10 @@ class ArbScanner:
         report raw-vs-kept so a starved universe explains itself."""
         out, cursor, raw = [], None, 0
         sess = self._sess()
-        max_close = int(time.time()) + 35 * 86400   # arb wants near-dated
+        max_close = int(time.time()) + 21 * 86400   # near-dated: locks cycle capital fastest
         sampled = False
         retries = 0
-        for _ in range(60):
+        for _ in range(120):
             params = {"status": "open", "limit": 1000,
                       "max_close_ts": max_close}
             if cursor:
