@@ -293,33 +293,48 @@ class ArbScanner:
             logger.info(f"arb: {new} new candidate pair(s)")
 
     async def _kalshi_universe(self) -> List[dict]:
-        out, cursor = [], None
+        """All open markets closing within 60 days, volume-filtered.
+        Kalshi pages alphabetically and the alphabet's head is full of
+        dead series — so page deep (up to 30), bound by close date, and
+        report raw-vs-kept so a starved universe explains itself."""
+        out, cursor, raw = [], None, 0
         sess = self._sess()
-        for _ in range(8):
-            params = {"status": "open", "limit": 500}
+        max_close = int(time.time()) + 60 * 86400
+        for _ in range(30):
+            params = {"status": "open", "limit": 1000,
+                      "max_close_ts": max_close}
             if cursor:
                 params["cursor"] = cursor
             try:
                 async with sess.get(f"{KALSHI_BASE}/markets", params=params,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
                     if r.status != 200:
-                        logger.warning(f"kalshi markets HTTP {r.status}")
+                        logger.warning(f"kalshi markets HTTP {r.status}: "
+                                       f"{(await r.text())[:150]}")
                         break
                     resp = await r.json()
             except Exception as e:
-                logger.debug(f"kalshi universe: {e}")
+                logger.warning(f"kalshi universe fetch: {e}")
                 break
-            for m in resp.get("markets", []):
+            page = resp.get("markets", [])
+            raw += len(page)
+            if raw and not out and len(page):
+                m0 = page[0]
+                logger.info(f"arb kalshi sample: ticker={m0.get('ticker')} "
+                            f"vol={m0.get('volume')} "
+                            f"keys={sorted(m0.keys())[:10]}")
+            for m in page:
                 try:
-                    if float(m.get("volume") or 0) < 50:
+                    if float(m.get("volume") or 0) < 20:
                         continue
                     out.append({"ticker": m["ticker"],
                                 "title": m.get("title") or ""})
                 except (TypeError, KeyError):
                     continue
             cursor = resp.get("cursor")
-            if not cursor:
+            if not cursor or len(out) >= 4000:
                 break
+        logger.info(f"arb kalshi universe: kept {len(out)} of {raw} raw")
         return out
 
     async def _kalshi_orderbook(self, ticker: str) -> Optional[dict]:
@@ -336,12 +351,15 @@ class ArbScanner:
             return None
 
     async def _pm_universe(self) -> List[dict]:
+        """Gamma caps pages at 100 rows no matter the limit asked — walk
+        offsets until empty, up to 1000 top-liquidity markets."""
         out = []
         sess = self._sess()
-        for offset in (0, 500):
+        offset = 0
+        while offset < 1000:
             try:
                 async with sess.get(
-                        GAMMA, params={"closed": "false", "limit": 500,
+                        GAMMA, params={"closed": "false", "limit": 100,
                                        "offset": offset, "order": "volumeNum",
                                        "ascending": "false"},
                         timeout=aiohttp.ClientTimeout(total=15)) as r:
@@ -369,8 +387,10 @@ class ArbScanner:
                                 "fee_bps": fee_bps})
                 except Exception:
                     continue
-            if not data or len(data) < 500:
+            if not data:
                 break
+            offset += len(data)
+        logger.info(f"arb pm universe: {len(out)} markets kept")
         return out
 
     # ── executable-lock checks on approved pairs ────────────────────────
