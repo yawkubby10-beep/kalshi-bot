@@ -137,6 +137,60 @@ def is_crypto_price_market(title: str) -> bool:
     return bool(toks & CRYPTO_BLOCK) and bool(extract_numbers(title))
 
 
+_MON = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+_VERBS_SOFT = {"compete", "competes", "qualify", "qualifies", "appear",
+               "appears", "play", "plays", "participate", "top", "make",
+               "makes", "finish", "finishes"}
+_VERBS_WIN = {"win", "wins", "winner", "champion"}
+
+
+def _kalshi_deadline(ticker: str):
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})?(?:-|$)", ticker)
+    if not m or m.group(2) not in _MON:
+        return None
+    return (2000 + int(m.group(1)), _MON[m.group(2)],
+            int(m.group(3)) if m.group(3) else None)
+
+
+def _pm_deadline(text: str):
+    low = text.lower().replace("-", " ")
+    m = re.search(r"before\s+(20\d\d)\b", low)
+    if m:
+        return (int(m.group(1)) - 1, 12, 31)
+    m = re.search(r"before\s+([a-z]+)\s+(20\d\d)", low)
+    if m and m.group(1)[:3].upper() in _MON:
+        mo = _MON[m.group(1)[:3].upper()]
+        y = int(m.group(2))
+        return (y, mo - 1, 31) if mo > 1 else (y - 1, 12, 31)
+    m = re.search(r"by\s+([a-z]+)\s+(\d{1,2}),?\s+(20\d\d)", low)
+    if m and m.group(1)[:3].upper() in _MON:
+        return (int(m.group(3)), _MON[m.group(1)[:3].upper()],
+                int(m.group(2)))
+    return None
+
+
+def pair_hints(k_ticker: str, k_title: str, pm_title: str,
+               pm_slug: str) -> str:
+    hints = []
+    kd = _kalshi_deadline(k_ticker)
+    pd = _pm_deadline(pm_title) or _pm_deadline(pm_slug)
+    if kd and pd and (kd[0], kd[1]) != (pd[0], pd[1]):
+        hints.append(f"⚠️ DEADLINES DIFFER: Kalshi ~{kd[0]}-{kd[1]:02d}"
+                     f"{'-%02d' % kd[2] if kd[2] else ''} vs Poly "
+                     f"~{pd[0]}-{pd[1]:02d} → almost certainly REJECT")
+    kt, pt = tokens_of(k_title), tokens_of(pm_title)
+    a_soft, a_win = kt & _VERBS_SOFT, kt & _VERBS_WIN
+    b_soft, b_win = pt & _VERBS_SOFT, pt & _VERBS_WIN
+    if (a_soft and b_win and not a_win) or (b_soft and a_win and not b_win):
+        hints.append("⚠️ DIFFERENT QUESTIONS: 'compete/qualify/top' vs "
+                     "'win' → REJECT")
+    if not hints:
+        hints.append("no obvious mismatch found — still read both rule "
+                     "pages before ✅")
+    return "\n".join(hints)
+
+
 def template_key(k_ticker: str, pm_slug: str) -> str:
     series = k_ticker.split("-")[0]
     slug_t = re.sub(r"\d+", "#", pm_slug)
@@ -297,8 +351,10 @@ class ArbScanner:
                             f"🔀 ARB CANDIDATE #{cur.lastrowid} "
                             f"(match {s:.0%}){note}\n"
                             f"K: {kt}\nP: {pm['title']}\n"
-                            f"Verify both rule pages, then /arbpairs "
-                            f"to approve or reject.")
+                            + pair_hints(km["ticker"], kt, pm["title"],
+                                         pm["slug"]) + "\n"
+                            f"/arbpairs to approve or reject — when "
+                            f"unsure, REJECT (costs nothing).")
                 except Exception as e:
                     logger.debug(f"pair insert: {e}")
         self.db.commit()

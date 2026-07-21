@@ -980,8 +980,10 @@ async def cmd_arbpairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"#{r['id']} (match {r['score']:.0%})\n"
             f"KALSHI: {r['k_title']}\n  ticker {r['k_ticker']}\n"
             f"POLY:   {r['pm_title']}\n  slug {r['pm_slug']}\n"
-            f"⚠️ approve ONLY after reading both rule pages — resolution "
-            f"mismatch is the one real risk.", reply_markup=kb)
+            + __import__('arb_scanner').pair_hints(
+                r['k_ticker'], r['k_title'], r['pm_title'], r['pm_slug'])
+            + "\nWhen unsure: REJECT. More candidates always come.",
+            reply_markup=kb)
 
 
 async def cmd_arblog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
