@@ -110,21 +110,26 @@ def tokens_of(text: str) -> frozenset:
                      if w not in STOP_WORDS and w not in MONTHS)
 
 
-def match_score(title_a: str, title_b: str) -> float:
-    """0.0 = no match. Requires identical number sets AND identical month
-    sets; score is then the Jaccard overlap of remaining tokens."""
-    if extract_numbers(title_a) != extract_numbers(title_b):
+def features(title: str) -> tuple:
+    """Precomputed match features: (numbers, months, years, tokens)."""
+    return (extract_numbers(title), extract_months(title),
+            extract_years(title), tokens_of(title))
+
+
+def match_features(fa: tuple, fb: tuple) -> float:
+    if fa[0] != fb[0]:
         return 0.0                    # thresholds must match exactly
-    if not _compatible(extract_months(title_a), extract_months(title_b)):
+    if not _compatible(fa[1], fb[1]) or not _compatible(fa[2], fb[2]):
         return 0.0
-    if not _compatible(extract_years(title_a), extract_years(title_b)):
-        return 0.0
-    ta, tb = tokens_of(title_a), tokens_of(title_b)
+    ta, tb = fa[3], fb[3]
     if not ta or not tb:
         return 0.0
-    inter = len(ta & tb)
     union = len(ta | tb)
-    return inter / union if union else 0.0
+    return len(ta & tb) / union if union else 0.0
+
+
+def match_score(title_a: str, title_b: str) -> float:
+    return match_features(features(title_a), features(title_b))
 
 
 def is_crypto_price_market(title: str) -> bool:
@@ -253,6 +258,15 @@ class ArbScanner:
         pending = self.db.execute(
             "SELECT COUNT(*) c FROM pairs WHERE status='pending'"
         ).fetchone()["c"]
+        # Precompute features once per side and bucket Polymarket by its
+        # number-set — a Kalshi title can only ever match PM titles with
+        # the identical threshold set, so we compare within buckets only.
+        pm_buckets: Dict[frozenset, list] = {}
+        for pm in pm_markets:
+            if is_crypto_price_market(pm["title"]):
+                continue
+            fp = features(pm["title"])
+            pm_buckets.setdefault(fp[0], []).append((fp, pm))
         new = 0
         for km in k_markets:
             if pending + new >= MAX_PENDING:
@@ -260,10 +274,9 @@ class ArbScanner:
             kt = km["title"]
             if is_crypto_price_market(kt):
                 continue
-            for pm in pm_markets:
-                if is_crypto_price_market(pm["title"]):
-                    continue
-                s = match_score(kt, pm["title"])
+            fk = features(kt)
+            for fp, pm in pm_buckets.get(fk[0], []):
+                s = match_features(fk, fp)
                 if s < 0.45:
                     continue
                 tpl = template_key(km["ticker"], pm["slug"])
@@ -300,7 +313,9 @@ class ArbScanner:
         out, cursor, raw = [], None, 0
         sess = self._sess()
         max_close = int(time.time()) + 60 * 86400
-        for _ in range(30):
+        sampled = False
+        retries = 0
+        for _ in range(40):
             params = {"status": "open", "limit": 1000,
                       "max_close_ts": max_close}
             if cursor:
@@ -308,6 +323,14 @@ class ArbScanner:
             try:
                 async with sess.get(f"{KALSHI_BASE}/markets", params=params,
                                     timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 429:
+                        retries += 1
+                        if retries > 6:
+                            logger.warning("kalshi universe: giving up "
+                                           "after repeated 429s")
+                            break
+                        await asyncio.sleep(2.5 * retries)
+                        continue          # retry same cursor
                     if r.status != 200:
                         logger.warning(f"kalshi markets HTTP {r.status}: "
                                        f"{(await r.text())[:150]}")
@@ -316,24 +339,31 @@ class ArbScanner:
             except Exception as e:
                 logger.warning(f"kalshi universe fetch: {e}")
                 break
+            retries = 0
             page = resp.get("markets", [])
             raw += len(page)
-            if raw and not out and len(page):
+            if not sampled and page:
+                sampled = True
                 m0 = page[0]
-                logger.info(f"arb kalshi sample: ticker={m0.get('ticker')} "
-                            f"vol={m0.get('volume')} "
-                            f"keys={sorted(m0.keys())[:10]}")
+                logger.info(f"arb kalshi sample: {m0.get('ticker')} "
+                            f"last_px={m0.get('last_price_dollars')}")
             for m in page:
                 try:
-                    if float(m.get("volume") or 0) < 20:
+                    # 'volume' does not exist on this endpoint; a last
+                    # traded price is the liveness signal that does.
+                    lp = m.get("last_price_dollars") or m.get("last_price")
+                    if lp in (None, "", 0, "0", "0.0", "0.00"):
+                        continue
+                    if not m.get("title"):
                         continue
                     out.append({"ticker": m["ticker"],
-                                "title": m.get("title") or ""})
+                                "title": m["title"]})
                 except (TypeError, KeyError):
                     continue
             cursor = resp.get("cursor")
-            if not cursor or len(out) >= 4000:
+            if not cursor:
                 break
+            await asyncio.sleep(0.45)     # stay under the public rate limit
         logger.info(f"arb kalshi universe: kept {len(out)} of {raw} raw")
         return out
 
