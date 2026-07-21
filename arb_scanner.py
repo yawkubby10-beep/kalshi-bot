@@ -368,10 +368,10 @@ class ArbScanner:
         report raw-vs-kept so a starved universe explains itself."""
         out, cursor, raw = [], None, 0
         sess = self._sess()
-        max_close = int(time.time()) + 60 * 86400
+        max_close = int(time.time()) + 35 * 86400   # arb wants near-dated
         sampled = False
         retries = 0
-        for _ in range(40):
+        for _ in range(60):
             params = {"status": "open", "limit": 1000,
                       "max_close_ts": max_close}
             if cursor:
@@ -408,7 +408,10 @@ class ArbScanner:
                     # 'volume' does not exist on this endpoint; a last
                     # traded price is the liveness signal that does.
                     lp = m.get("last_price_dollars") or m.get("last_price")
-                    if lp in (None, "", 0, "0", "0.0", "0.00"):
+                    try:
+                        if not lp or float(lp) <= 0:
+                            continue          # never traded = dead market
+                    except (TypeError, ValueError):
                         continue
                     if not m.get("title"):
                         continue
@@ -420,6 +423,9 @@ class ArbScanner:
             if not cursor:
                 break
             await asyncio.sleep(0.45)     # stay under the public rate limit
+        else:
+            logger.warning("arb kalshi universe truncated at page cap — "
+                           "alphabet tail unscanned; narrow the window")
         logger.info(f"arb kalshi universe: kept {len(out)} of {raw} raw")
         return out
 
