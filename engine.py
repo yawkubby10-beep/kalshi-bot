@@ -604,6 +604,20 @@ class Store:
                 "AND mode=? AND ts>=?", (mode, day0))
             return float(cur.fetchone()[0] or 0.0)
 
+    def daily_breakdown(self, mode: str, days: int = 14) -> list:
+        """One row per UTC day (Ghana local = UTC): trades, wins, pnl, fees.
+        Newest first."""
+        cutoff = time.time() - days * 86400
+        with self.lock:
+            cur = self.db.execute(
+                "SELECT date(ts,'unixepoch') d, COUNT(*) n, "
+                "SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) w, "
+                "SUM(pnl) pnl, SUM(fee) fee, MIN(ts) first_ts "
+                "FROM trades WHERE status='closed' AND mode=? AND ts>=? "
+                "GROUP BY d ORDER BY d DESC", (mode, cutoff))
+            return [dict(zip(("d", "n", "w", "pnl", "fee", "first_ts"), r))
+                    for r in cur.fetchall()]
+
     def set_kv(self, key: str, val: float):
         with self.lock:
             self.db.execute(

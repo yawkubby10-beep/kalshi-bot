@@ -796,7 +796,8 @@ def panel():
          InlineKeyboardButton("🔧 Settings", callback_data="cfg")],
         [InlineKeyboardButton("🔬 Why no trades?", callback_data="diag"),
          InlineKeyboardButton("♻️ Reset calib", callback_data="calibreset")],
-        [InlineKeyboardButton("🔀 Arb scanner", callback_data="arb")],
+        [InlineKeyboardButton("🔀 Arb scanner", callback_data="arb"),
+         InlineKeyboardButton("📅 Daily", callback_data="daily")],
         [InlineKeyboardButton("🚨 Kill", callback_data="kill"),
          InlineKeyboardButton("▶️ Resume", callback_data="resume")],
     ])
@@ -816,6 +817,31 @@ def txt_pnl() -> str:
             f"| reality {s['win_rate']}%\n"
             f"Today: ${store.daily_pnl(MODE):+.2f}"
             + _calib_window_txt())
+
+
+def txt_daily() -> str:
+    rows = store.daily_breakdown(MODE, days=14)
+    if not rows:
+        return "No closed trades yet."
+    reset_ts = store.get_kv("calib_since")
+    s_all = store.summary(MODE)
+    out = ["📅 Daily P&L [" + MODE.upper() + "]", "━━━━━━━━━━━━"]
+    for r in rows:
+        era = ""
+        if reset_ts > 0 and r["first_ts"] < reset_ts:
+            era = " ⚠️old-model"
+        out.append(f"{r['d']}  {r['n']}T {r['w']}W  "
+                   f"${r['pnl']:+.2f}{era}")
+    out.append("━━━━━━━━━━━━")
+    out.append(f"Lifetime: ${s_all['pnl']:+.2f} over {s_all['trades']}T "
+               f"(fees ${s_all['fees']:.2f})")
+    if reset_ts > 0:
+        s2 = store.summary(MODE, reset_ts)
+        if s2.get("trades"):
+            out.append(f"Clean window: ${s2['pnl']:+.2f} over "
+                       f"{s2['trades']}T since calib reset")
+    out.append("(days are UTC — same as Ghana time)")
+    return "\n".join(out)
 
 
 def _calib_window_txt() -> str:
@@ -923,6 +949,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Convergence + Lag | {', '.join(CRYPTOS)}", reply_markup=panel())
 
 
+async def cmd_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER:
+        return
+    await update.message.reply_text(txt_daily())
+
+
 async def cmd_arb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER:
         return
@@ -993,6 +1025,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(txt_fills())
     elif d == "diag":
         await q.edit_message_text(txt_diag())
+    elif d == "daily":
+        await q.edit_message_text(txt_daily())
     elif d == "arb":
         await q.edit_message_text(
             arb.txt_status() if arb else "Arb scanner not started yet.")
@@ -1110,6 +1144,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("arb", cmd_arb))
     app.add_handler(CommandHandler("arbpairs", cmd_arbpairs))
     app.add_handler(CommandHandler("arblog", cmd_arblog))
