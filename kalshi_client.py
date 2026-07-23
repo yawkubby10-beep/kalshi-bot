@@ -19,10 +19,31 @@ Therefore:
 
 Cancels MUST be signed (old resolver sent unauthenticated DELETEs → 401 →
 stale resting orders sat in the book getting picked off).
+
+TRANSPORT (the 2026-07-23 EOF incident): Create Order V2 takes a JSON body.
+The old `_req(method, path, params=None, body=None)` signature let callers
+pass the order dict POSITIONALLY into the `params` slot — every field rode
+the query string, the body went out empty, and Kalshi answered
+{"details":"EOF"} on every live maker post. `params`/`body` are now
+KEYWORD-ONLY, so that whole bug class is a TypeError at the call site.
+
+SAFETY RAILS (welded into the client, not the caller):
+- PAPER_MODE (env, default TRUE): order creation and cancels raise
+  PaperModeViolation. Paper is structurally incapable of touching the
+  order endpoints, whatever the caller believes.
+- LIVE_MAX_COUNT (env, default 1): tuition sizing. Live opening orders
+  are clamped to this count; reduce_only exits are exempt so positions
+  can always be closed in full.
+- No retries on 4xx (bad requests don't heal). One short retry on
+  429/5xx with a freshly signed timestamp. The expiration_time-stripping
+  fallback is deleted: the field is spec-valid, and stripping it would
+  silently post a NEVER-expiring maker.
 """
 
 import base64
 import logging
+import os
+import random
 import time
 import uuid
 from typing import Dict, Optional
@@ -35,6 +56,22 @@ logger = logging.getLogger("kalshi")
 
 BASE_URL = "https://api.elections.kalshi.com"
 API_PATH = "/trade-api/v2"
+
+
+class PaperModeViolation(RuntimeError):
+    """Raised when anything tries to place/cancel real orders in paper."""
+
+
+def _paper_mode() -> bool:
+    return os.getenv("PAPER_MODE", "true").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _live_max_count() -> int:
+    try:
+        return max(1, int(float(os.getenv("LIVE_MAX_COUNT", "1"))))
+    except (TypeError, ValueError):
+        return 1
 
 
 class KalshiClient:
@@ -68,20 +105,34 @@ class KalshiClient:
             "Content-Type": "application/json",
         }
 
-    def _req(self, method: str, path: str, params: Dict = None,
+    def _req(self, method: str, path: str, *, params: Dict = None,
              body: Dict = None) -> Dict:
+        """params/body are KEYWORD-ONLY on purpose — see module docstring."""
         full = API_PATH + path
         url = BASE_URL + full
-        if params:
-            url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        r = self._s.request(method, url,
-                            headers=self._headers(method, full),
-                            json=body, timeout=10)
-        if r.status_code >= 400:
-            logger.error(f"Kalshi {method} {path} → {r.status_code}: "
-                         f"{r.text[:300]}")
-        r.raise_for_status()
-        return r.json() if r.text else {}
+        attempts = 0
+        while True:
+            attempts += 1
+            r = self._s.request(method, url,
+                                headers=self._headers(method, full),
+                                params=params, json=body, timeout=10)
+            if (r.status_code == 429 or r.status_code >= 500) and attempts < 2:
+                time.sleep(0.7 + random.uniform(0.0, 0.4))
+                continue                      # fresh signature next lap
+            if r.status_code >= 400:
+                logger.error(f"Kalshi {method} {path} → {r.status_code}: "
+                             f"{r.text[:300]}")
+            r.raise_for_status()
+            return r.json() if r.text else {}
+
+    # ── paper gate ───────────────────────────────────────────────────────
+    def _mutation_gate(self, what: str):
+        if _paper_mode():
+            logger.critical(
+                f"PAPER MODE: refused {what} — the client does not touch "
+                f"order endpoints in paper. If you intended live trading, "
+                f"set PAPER_MODE=false explicitly.")
+            raise PaperModeViolation(what)
 
     # ── account / data ───────────────────────────────────────────────────
     def get_balance(self) -> float:
@@ -93,15 +144,15 @@ class KalshiClient:
 
     def get_orderbook(self, ticker: str, depth: int = 16) -> Dict:
         return self._req("GET", f"/markets/{ticker}/orderbook",
-                         {"depth": depth})
+                         params={"depth": depth})
 
     def get_positions(self) -> list:
         return self._req("GET", "/portfolio/positions",
-                         {"limit": 100}).get("market_positions", [])
+                         params={"limit": 100}).get("market_positions", [])
 
     def get_fills(self, limit: int = 50) -> list:
         return self._req("GET", "/portfolio/fills",
-                         {"limit": limit}).get("fills", [])
+                         params={"limit": limit}).get("fills", [])
 
     def get_order(self, order_id: str) -> Dict:
         resp = self._req("GET", f"/portfolio/orders/{order_id}")
@@ -111,6 +162,14 @@ class KalshiClient:
     def _create(self, ticker: str, yes_leg_side: str, price_yes_d: float,
                 count: int, tif: str, post_only: bool,
                 expiration_ts: Optional[int], reduce_only: bool) -> Dict:
+        self._mutation_gate(f"order {yes_leg_side} {ticker}")
+        if not reduce_only:
+            cap = _live_max_count()
+            if count > cap:
+                logger.warning(
+                    f"LIVE_MAX_COUNT: clamping {count} → {cap} contracts "
+                    f"(tuition sizing — raise the env var to lift)")
+                count = cap
         price_yes_d = min(0.99, max(0.01, round(price_yes_d, 2)))
         body = {
             "ticker": ticker,
@@ -126,17 +185,7 @@ class KalshiClient:
         }
         if expiration_ts and tif == "good_till_canceled":
             body["expiration_time"] = int(expiration_ts)
-        try:
-            resp = self._req("POST", "/portfolio/events/orders", body)
-        except requests.HTTPError as e:
-            # Defensive: some deployments reject expiration_time — retry once
-            if (body.pop("expiration_time", None) is not None
-                    and e.response is not None
-                    and e.response.status_code == 400):
-                logger.warning("Retrying order without expiration_time")
-                resp = self._req("POST", "/portfolio/events/orders", body)
-            else:
-                raise
+        resp = self._req("POST", "/portfolio/events/orders", body=body)
         o = resp.get("order", resp)
         return {
             "order_id": o.get("order_id") or o.get("id") or "",
@@ -195,8 +244,9 @@ class KalshiClient:
 
     # ── cancels (SIGNED — this was broken before) ────────────────────────
     def cancel_order(self, order_id: str) -> bool:
-        for path in (f"/portfolio/orders/{order_id}",
-                     f"/portfolio/events/orders/{order_id}"):
+        self._mutation_gate(f"cancel {order_id}")
+        for path in (f"/portfolio/events/orders/{order_id}",
+                     f"/portfolio/orders/{order_id}"):
             try:
                 self._req("DELETE", path)
                 return True
