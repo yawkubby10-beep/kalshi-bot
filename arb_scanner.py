@@ -16,6 +16,14 @@ Doctrine (each rule bought with tuition elsewhere in the fleet):
 - Edges are computed from EXECUTABLE asks with visible size on both books,
   net of Kalshi's real taker fee and a conservative Polymarket fee model.
   Mid-price fantasies don't get logged.
+- Series-scoped universe. Kalshi's flat market list (120k+ open inside
+  21 days after the sports-singles explosion) cannot be paged whole; the
+  scanner censuses the series catalogue by category instead (cached),
+  keeps the lock heartland plus any series sharing real tokens with the
+  live Polymarket universe, and fetches markets series-by-series. Nothing
+  is silently unscanned — what's skipped is skipped by name — and every
+  kept market arrives stamped with series + category, letting the matcher
+  veto cross-league city collisions (Guadalajara ≠ Dodgers).
 """
 
 import asyncio
@@ -23,6 +31,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import time
@@ -48,6 +57,22 @@ UNIVERSE_INTERVAL = float(os.getenv("ARB_UNIVERSE_INTERVAL", "900"))
 ALERT_COOLDOWN = float(os.getenv("ARB_ALERT_COOLDOWN", "1800"))
 MAX_PENDING = 40
 
+# series-scoped fetch knobs
+SERIES_TTL = float(os.getenv("ARB_SERIES_TTL", "43200"))   # census cache 12h
+MAX_SERIES = int(os.getenv("ARB_MAX_SERIES", "400"))       # shelf size cap
+REQ_SLEEP = float(os.getenv("ARB_REQ_SLEEP", "0.12"))      # ~8 req/s of the
+                                                           # 20/s Basic budget
+REQ_BUDGET = int(os.getenv("ARB_REQ_BUDGET", "700"))       # hard cap per scan
+
+FALLBACK_CATEGORIES = [
+    "Politics", "Economics", "Financials", "Companies", "World",
+    "Science and Technology", "Climate and Weather", "Health",
+    "Entertainment", "Culture", "Sports", "Crypto", "Transportation",
+]
+# lock heartland: always fetched, no PM-token gate needed
+CORE_CATEGORIES = ("econom", "politic", "financ", "world", "compan",
+                   "climate", "weather", "science", "health")
+
 STOP_WORDS = {"will", "the", "be", "in", "on", "at", "of", "a", "an", "to",
               "by", "for", "or", "and", "vs", "market", "before", "after",
               "with", "is", "does", "do", "than", "more", "less", "who",
@@ -57,6 +82,13 @@ MONTHS = ("january february march april may june july august september "
           "oct nov dec").split()
 CRYPTO_BLOCK = {"bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp",
                 "dogecoin", "doge", "cardano", "ada"}
+
+# league identifiers as they appear in Kalshi series tickers/titles and
+# Polymarket slugs — used to veto city-name collisions across sports
+LEAGUE_IDS = {"mlb", "nba", "nfl", "nhl", "wnba", "mls", "epl", "ucl",
+              "uel", "uefa", "ncaa", "ncaab", "ncaaf", "atp", "wta", "f1",
+              "nascar", "ufc", "pga", "kbo", "npb", "ipl", "bundesliga",
+              "ligue", "laliga", "ligamx", "seriea", "cfl", "afl"}
 
 
 # ── text matching primitives ──────────────────────────────────────────────
@@ -137,6 +169,42 @@ def is_crypto_price_market(title: str) -> bool:
     return bool(toks & CRYPTO_BLOCK) and bool(extract_numbers(title))
 
 
+def is_crypto_price_series(text: str) -> bool:
+    """Series-level version of the oracle-mismatch doctrine: price/level
+    series on coins never get fetched at all (their titles carry the coin
+    plus price language, usually without a literal number)."""
+    toks = tokens_of(text)
+    if not toks & CRYPTO_BLOCK:
+        return False
+    return bool(toks & {"price", "above", "below", "reach", "hit",
+                        "between", "range", "high", "low", "close"})
+
+
+def leagues_in(*texts) -> frozenset:
+    """Best-effort league identity from any mix of tickers, titles, slugs.
+    Token pass first, then a squashed-substring pass for compact ids that
+    survive slug punctuation (ligamx, laliga, seriea)."""
+    found = set()
+    for t in texts:
+        if not t:
+            continue
+        low = str(t).lower()
+        found |= frozenset(re.findall(r"[a-z0-9]+", low)) & LEAGUE_IDS
+        squashed = re.sub(r"[^a-z0-9]", "", low)
+        for lid in ("ligamx", "laliga", "seriea", "ncaab", "ncaaf"):
+            if lid in squashed:
+                found.add(lid)
+    return frozenset(found)
+
+
+def league_conflict(k_texts: tuple, pm_texts: tuple) -> bool:
+    """True when BOTH sides declare a league and the leagues share nothing
+    — the Guadalajara/Dodgers class of city-token collision. One-sided or
+    silent league info never vetoes; the human gate handles those."""
+    ka, pa = leagues_in(*k_texts), leagues_in(*pm_texts)
+    return bool(ka) and bool(pa) and not (ka & pa)
+
+
 _MON = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
         "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 _VERBS_SOFT = {"compete", "competes", "qualify", "qualifies", "appear",
@@ -171,8 +239,10 @@ def _pm_deadline(text: str):
 
 
 def pair_hints(k_ticker: str, k_title: str, pm_title: str,
-               pm_slug: str) -> str:
+               pm_slug: str, k_series_desc: str = "") -> str:
     hints = []
+    if k_series_desc:
+        hints.append(f"K series: {k_series_desc}")
     kd = _kalshi_deadline(k_ticker)
     pd = _pm_deadline(pm_title) or _pm_deadline(pm_slug)
     if kd and pd and (kd[0], kd[1]) != (pd[0], pd[1]):
@@ -185,7 +255,14 @@ def pair_hints(k_ticker: str, k_title: str, pm_title: str,
     if (a_soft and b_win and not a_win) or (b_soft and a_win and not b_win):
         hints.append("⚠️ DIFFERENT QUESTIONS: 'compete/qualify/top' vs "
                      "'win' → REJECT")
-    if not hints:
+    kl = leagues_in(k_ticker, k_title, k_series_desc)
+    pl = leagues_in(pm_title, pm_slug)
+    if kl and pl and kl & pl:
+        hints.append(f"league match: {', '.join(sorted(kl & pl))} ✓")
+    elif kl or pl:
+        hints.append("⚠️ league visible on one side only — confirm same "
+                     "competition before ✅")
+    if len(hints) <= 1:
         hints.append("no obvious mismatch found — still read both rule "
                      "pages before ✅")
     return "\n".join(hints)
@@ -287,8 +364,42 @@ class ArbScanner:
         """)
         self.db.commit()
         self._last_alert: Dict[int, float] = {}
+        self._series_cache: Dict[str, object] = {"ts": 0.0, "series": []}
         self.stats = {"k_markets": 0, "pm_markets": 0, "checks": 0,
                       "last_universe": 0.0}
+
+    # ── paced GET with token-bucket-aware backoff ───────────────────────
+    async def _kget(self, path: str, params: dict,
+                    budget: dict) -> Optional[dict]:
+        """One paced request against the public API. 429s carry no
+        Retry-After under the 2026 token-bucket model — exponential
+        backoff with jitter, retry same request, give up after 6."""
+        sess = self._sess()
+        backoff = 0.8
+        for _ in range(6):
+            if budget["req"] >= budget["cap"]:
+                budget["exhausted"] = True
+                return None
+            budget["req"] += 1
+            try:
+                async with sess.get(f"{KALSHI_BASE}{path}", params=params,
+                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 429:
+                        await asyncio.sleep(backoff
+                                            + random.uniform(0, backoff))
+                        backoff = min(backoff * 2, 8.0)
+                        continue
+                    if r.status != 200:
+                        logger.debug(f"kalshi {path} HTTP {r.status}")
+                        return None
+                    data = await r.json()
+            except Exception as e:
+                logger.debug(f"kalshi {path}: {e}")
+                return None
+            await asyncio.sleep(REQ_SLEEP)
+            return data
+        logger.warning(f"kalshi {path}: repeated 429s — skipping")
+        return None
 
     # ── universe refresh + candidate nomination ─────────────────────────
     async def universe_loop(self):
@@ -301,8 +412,13 @@ class ArbScanner:
             await asyncio.sleep(UNIVERSE_INTERVAL)
 
     async def _refresh_universe(self):
-        k_markets = await self._kalshi_universe()
+        # PM first — its token set drives which Kalshi series get fetched.
         pm_markets = await self._pm_universe()
+        pm_tokens = frozenset()
+        for pm in pm_markets:
+            pm_tokens |= tokens_of(pm["title"] + " "
+                                   + pm["slug"].replace("-", " "))
+        k_markets = await self._kalshi_universe(pm_tokens)
         self.stats.update(k_markets=len(k_markets),
                           pm_markets=len(pm_markets),
                           last_universe=time.time())
@@ -333,6 +449,11 @@ class ArbScanner:
                 s = match_features(fk, fp)
                 if s < 0.45:
                     continue
+                if league_conflict(
+                        (km["ticker"], kt, km["series"], km["s_title"],
+                         km["category"]),
+                        (pm["slug"], pm["title"])):
+                    continue      # city tokens, different sport — veto
                 tpl = template_key(km["ticker"], pm["slug"])
                 try:
                     cur = self.db.execute(
@@ -352,7 +473,9 @@ class ArbScanner:
                             f"(match {s:.0%}){note}\n"
                             f"K: {kt}\nP: {pm['title']}\n"
                             + pair_hints(km["ticker"], kt, pm["title"],
-                                         pm["slug"]) + "\n"
+                                         pm["slug"],
+                                         f"{km['s_title']} "
+                                         f"[{km['category']}]") + "\n"
                             f"/arbpairs to approve or reject — when "
                             f"unsure, REJECT (costs nothing).")
                 except Exception as e:
@@ -361,72 +484,161 @@ class ArbScanner:
         if new:
             logger.info(f"arb: {new} new candidate pair(s)")
 
-    async def _kalshi_universe(self) -> List[dict]:
-        """All open markets closing within 60 days, volume-filtered.
-        Kalshi pages alphabetically and the alphabet's head is full of
-        dead series — so page deep (up to 30), bound by close date, and
-        report raw-vs-kept so a starved universe explains itself."""
-        out, cursor, raw = [], None, 0
-        sess = self._sess()
-        max_close = int(time.time()) + 21 * 86400   # near-dated: locks cycle capital fastest
-        sampled = False
-        retries = 0
-        for _ in range(120):
-            params = {"status": "open", "limit": 1000,
-                      "max_close_ts": max_close}
-            if cursor:
-                params["cursor"] = cursor
-            try:
-                async with sess.get(f"{KALSHI_BASE}/markets", params=params,
-                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
-                    if r.status == 429:
-                        retries += 1
-                        if retries > 6:
-                            logger.warning("kalshi universe: giving up "
-                                           "after repeated 429s")
-                            break
-                        await asyncio.sleep(2.5 * retries)
-                        continue          # retry same cursor
-                    if r.status != 200:
-                        logger.warning(f"kalshi markets HTTP {r.status}: "
-                                       f"{(await r.text())[:150]}")
-                        break
-                    resp = await r.json()
-            except Exception as e:
-                logger.warning(f"kalshi universe fetch: {e}")
-                break
-            retries = 0
-            page = resp.get("markets", [])
-            raw += len(page)
-            if not sampled and page:
-                sampled = True
-                m0 = page[0]
-                logger.info(f"arb kalshi sample: {m0.get('ticker')} "
-                            f"last_px={m0.get('last_price_dollars')}")
-            for m in page:
-                try:
-                    # 'volume' does not exist on this endpoint; a last
-                    # traded price is the liveness signal that does.
-                    lp = m.get("last_price_dollars") or m.get("last_price")
-                    try:
-                        if not lp or float(lp) <= 0:
-                            continue          # never traded = dead market
-                    except (TypeError, ValueError):
+    # ── series census (cached) ──────────────────────────────────────────
+    async def _series_census(self, budget: dict) -> List[dict]:
+        now = time.time()
+        cached = self._series_cache["series"]
+        if cached and now - self._series_cache["ts"] < SERIES_TTL:
+            return cached
+        cats: List[str] = []
+        data = await self._kget("/search/tags_by_categories", {}, budget)
+        if isinstance(data, dict):
+            inner = data.get("tags_by_categories", data)
+            if isinstance(inner, dict):
+                cats = [c for c in inner.keys() if isinstance(c, str)]
+            elif isinstance(inner, list):
+                for it in inner:
+                    if isinstance(it, dict):
+                        c = it.get("category") or it.get("name")
+                        if c:
+                            cats.append(c)
+        if not cats:
+            cats = list(FALLBACK_CATEGORIES)
+            logger.info("arb census: category endpoint unhelpful — "
+                        "using fallback category list")
+        series: List[dict] = []
+        for cat in cats[:24]:
+            cursor = None
+            for _ in range(3):
+                params = {"category": cat, "limit": 1000}
+                if cursor:
+                    params["cursor"] = cursor
+                data = await self._kget("/series", params, budget)
+                if not data:
+                    break
+                for srow in data.get("series", []) or []:
+                    tick = srow.get("ticker")
+                    if not tick:
                         continue
-                    if not m.get("title"):
-                        continue
-                    out.append({"ticker": m["ticker"],
-                                "title": m["title"]})
-                except (TypeError, KeyError):
+                    tags = srow.get("tags") or []
+                    if not isinstance(tags, list):
+                        tags = []
+                    series.append({"ticker": tick,
+                                   "title": srow.get("title") or "",
+                                   "category": srow.get("category") or cat,
+                                   "tags": " ".join(str(x) for x in tags)})
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+        if series:
+            seen, uniq = set(), []
+            for srow in series:
+                if srow["ticker"] in seen:
                     continue
-            cursor = resp.get("cursor")
-            if not cursor:
+                seen.add(srow["ticker"])
+                uniq.append(srow)
+            self._series_cache = {"ts": now, "series": uniq}
+            logger.info(f"arb kalshi census: {len(uniq)} series across "
+                        f"{len(cats)} categories")
+            return uniq
+        logger.warning("arb kalshi census came back empty — reusing "
+                       f"previous census ({len(cached)} series)")
+        return cached
+
+    def _select_series(self, all_series: List[dict],
+                       pm_tokens: frozenset) -> List[dict]:
+        """The shelf: lock-heartland categories always; everything else
+        only if it shares real tokens with the live PM universe. Crypto
+        price/level series never (oracle-mismatch doctrine)."""
+        core, gated = [], []
+        for srow in all_series:
+            blob = f"{srow['title']} {srow['tags']} {srow['ticker']}"
+            if is_crypto_price_series(blob):
+                continue
+            cat = (srow["category"] or "").lower()
+            if any(c in cat for c in CORE_CATEGORIES):
+                core.append(srow)
+                continue
+            overlap = tokens_of(blob) & pm_tokens
+            if overlap:
+                gated.append((len(overlap), srow))
+        gated.sort(key=lambda x: -x[0])
+        picked = core + [srow for _, srow in gated]
+        if len(picked) > MAX_SERIES:
+            logger.warning(f"arb shelf capped at {MAX_SERIES} of "
+                           f"{len(picked)} selected series")
+            picked = picked[:MAX_SERIES]
+        n_core = min(len(core), len(picked))
+        logger.info(f"arb kalshi shelf: {len(picked)}/{len(all_series)} "
+                    f"series selected ({n_core} core + "
+                    f"{max(0, len(picked) - n_core)} pm-matched)")
+        return picked
+
+    async def _kalshi_universe(self, pm_tokens: frozenset) -> List[dict]:
+        """Series-scoped fetch. The flat alphabetical walk of /markets
+        died of scale: 120k+ open markets inside 21 days, every scan
+        truncated at the page cap, and the liveness filter could only
+        save memory — pages were spent on corpses before it ran. Now the
+        series catalogue (small, cached) decides what gets fetched, and
+        coverage of the selected shelf is complete by construction."""
+        budget = {"req": 0, "cap": REQ_BUDGET, "exhausted": False}
+        all_series = await self._series_census(budget)
+        if not all_series:
+            logger.warning("arb kalshi universe: no series census — "
+                           "skipping this refresh")
+            return []
+        picked = self._select_series(all_series, pm_tokens)
+        out: List[dict] = []
+        raw, fetched, sampled = 0, 0, False
+        max_close = int(time.time()) + 21 * 86400   # locks cycle capital fastest
+        for srow in picked:
+            if budget["exhausted"]:
                 break
-            await asyncio.sleep(0.45)     # stay under the public rate limit
-        else:
-            logger.warning("arb kalshi universe truncated at page cap — "
-                           "alphabet tail unscanned; narrow the window")
-        logger.info(f"arb kalshi universe: kept {len(out)} of {raw} raw")
+            cursor = None
+            for _ in range(3):            # pages per series — plenty
+                params = {"status": "open", "limit": 1000,
+                          "series_ticker": srow["ticker"],
+                          "max_close_ts": max_close}
+                if cursor:
+                    params["cursor"] = cursor
+                data = await self._kget("/markets", params, budget)
+                if not data:
+                    break
+                page = data.get("markets", []) or []
+                raw += len(page)
+                if not sampled and page:
+                    sampled = True
+                    m0 = page[0]
+                    logger.info(f"arb kalshi sample: {m0.get('ticker')} "
+                                f"last_px={m0.get('last_price_dollars')}")
+                for m in page:
+                    try:
+                        lp = (m.get("last_price_dollars")
+                              or m.get("last_price"))
+                        try:
+                            if not lp or float(lp) <= 0:
+                                continue      # never traded = dead market
+                        except (TypeError, ValueError):
+                            continue
+                        if not m.get("title"):
+                            continue
+                        out.append({"ticker": m["ticker"],
+                                    "title": m["title"],
+                                    "series": srow["ticker"],
+                                    "s_title": srow["title"],
+                                    "category": srow["category"]})
+                    except (TypeError, KeyError):
+                        continue
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+            fetched += 1
+        if budget["exhausted"]:
+            logger.warning(f"arb kalshi universe: request budget hit — "
+                           f"{len(picked) - fetched} selected series "
+                           f"unfetched this cycle")
+        logger.info(f"arb kalshi universe: kept {len(out)} of {raw} raw "
+                    f"across {fetched} series ({budget['req']} requests)")
         return out
 
     async def _kalshi_orderbook(self, ticker: str) -> Optional[dict]:
