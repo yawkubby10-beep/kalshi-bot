@@ -94,6 +94,12 @@ CRYPTO_BLOCK = {"bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp",
 
 # league identifiers as they appear in Kalshi series tickers/titles and
 # Polymarket slugs — used to veto city-name collisions across sports
+# Kalshi market families that bundle many games/outcomes into one ticker.
+# They share city/team words with countless single-event markets but can
+# never cleanly match one — pure false-positive factories. Skip on sight.
+JUNK_KALSHI_PREFIXES = ("KXMVESPORTSMULTIGAME", "KXMULTIGAME",
+                        "KXSPORTSMULTI", "KXMVE")
+
 LEAGUE_IDS = {"mlb", "nba", "nfl", "nhl", "wnba", "mls", "epl", "ucl",
               "uel", "uefa", "ncaa", "ncaab", "ncaaf", "atp", "wta", "f1",
               "nascar", "ufc", "pga", "kbo", "npb", "ipl", "bundesliga",
@@ -189,6 +195,12 @@ def is_crypto_price_series(text: str) -> bool:
                         "between", "range", "high", "low", "close"})
 
 
+def is_junk_kalshi(ticker: str) -> bool:
+    """Multi-game bundle markets: real ticker, but never a clean 1:1 pair."""
+    t = (ticker or "").upper()
+    return any(t.startswith(p) for p in JUNK_KALSHI_PREFIXES)
+
+
 def leagues_in(*texts) -> frozenset:
     """Best-effort league identity from any mix of tickers, titles, slugs.
     Token pass first, then a squashed-substring pass for compact ids that
@@ -206,12 +218,30 @@ def leagues_in(*texts) -> frozenset:
     return frozenset(found)
 
 
+# Which sport each league belongs to — lets us block soccer-vs-baseball
+# even when only one side names the league but the other names its teams.
+SOCCER = {"mls", "epl", "ucl", "uel", "uefa", "ligamx", "laliga", "seriea",
+          "bundesliga", "ligue"}
+BASEBALL = {"mlb", "kbo", "npb"}
+_SPORT_OF = {}
+for _lg in SOCCER: _SPORT_OF[_lg] = "soccer"
+for _lg in BASEBALL: _SPORT_OF[_lg] = "baseball"
+
+def _sports_of(leagues) -> frozenset:
+    return frozenset(_SPORT_OF[l] for l in leagues if l in _SPORT_OF)
+
 def league_conflict(k_texts: tuple, pm_texts: tuple) -> bool:
-    """True when BOTH sides declare a league and the leagues share nothing
-    — the Guadalajara/Dodgers class of city-token collision. One-sided or
-    silent league info never vetoes; the human gate handles those."""
+    """Block when the two sides are clearly different competitions.
+    Strong signal: both name leagues that share nothing. Also strong:
+    the sports they map to differ (soccer market vs baseball market),
+    even if only one side spells out the league."""
     ka, pa = leagues_in(*k_texts), leagues_in(*pm_texts)
-    return bool(ka) and bool(pa) and not (ka & pa)
+    if ka and pa and not (ka & pa):
+        return True
+    sk, sp = _sports_of(ka), _sports_of(pa)
+    if sk and sp and not (sk & sp):
+        return True
+    return False
 
 
 _MON = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -636,6 +666,8 @@ class ArbScanner:
                             continue
                         if not m.get("title"):
                             continue
+                        if is_junk_kalshi(m.get("ticker", "")):
+                            continue   # multi-game bundle — false-match factory
                         out.append({"ticker": m["ticker"],
                                     "title": m["title"],
                                     "series": srow["ticker"],
