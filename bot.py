@@ -136,6 +136,33 @@ DB_PATH = os.getenv("DB_PATH", "kalshi_v3.db")
 
 # ── Globals ─────────────────────────────────────────────────────────────────
 store = Store(DB_PATH)
+
+
+# ── one-time ledger repair: ×0-contract rows from the fills-schema bug ──
+def _purge_zero_contract_rows(db_path: str):
+    import sqlite3
+    try:
+        con = sqlite3.connect(db_path)
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        for t in tables:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
+            if "contracts" not in cols:
+                continue
+            rows = list(con.execute(
+                f"SELECT rowid, * FROM {t} WHERE contracts<=0"))
+            if not rows:
+                continue
+            for r in rows:
+                logger.warning(
+                    f"ledger repair: deleting zero-contract row in {t}: {r}")
+            con.execute(f"DELETE FROM {t} WHERE contracts<=0")
+            con.commit()
+        con.close()
+    except Exception:
+        logger.exception("ledger repair failed (non-fatal)")
+
+_purge_zero_contract_rows(DB_PATH)
 risk = RiskManager(store, MODE, MAX_DAILY_LOSS, MAX_CONCURRENT, PER_CRYPTO)
 spot = SpotFeed(CRYPTOS)
 client: Optional[KalshiClient] = None
@@ -376,7 +403,78 @@ async def on_paper_maker_fill(order, new_fill: int):
 paper.on_maker_fill = on_paper_maker_fill
 
 
+def _fill_count_of(f: dict) -> int:
+    """Contracts in a fill, across the int-cents era and the fp-string era."""
+    for k in ("count", "count_fp", "fill_count", "contracts", "quantity"):
+        v = f.get(k)
+        if v is None:
+            continue
+        try:
+            n = int(float(str(v)))
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return 0
+
+
+def _fill_yes_dollars(f: dict) -> float:
+    """YES-leg fill price in dollars, whichever era the field came from."""
+    for k in ("yes_price", "yes_price_fp", "yes_price_dollars",
+              "price", "price_dollars"):
+        v = f.get(k)
+        if v is None:
+            continue
+        try:
+            x = float(str(v))
+        except (TypeError, ValueError):
+            continue
+        if x <= 0:
+            continue
+        return x / 100.0 if x > 1.5 else x
+    return 0.0
+
+
+_reconciled = {"done": False}
+
+
+async def _reconcile_exchange_once():
+    """First live resolver pass each boot: ask the exchange what it holds,
+    shout about anything the ledger doesn't know. Alert-only, never books."""
+    if _reconciled["done"]:
+        return
+    _reconciled["done"] = True
+    try:
+        rows = await asyncio.to_thread(client.get_positions)
+    except Exception as e:
+        logger.warning(f"reconcile: positions fetch failed: {e}")
+        return
+    known = {p["ticker"] for p in open_positions}
+    for r in rows or []:
+        tick = r.get("ticker", "?")
+        qty = 0.0
+        for k in ("position", "position_fp", "total_position",
+                  "quantity", "count"):
+            v = r.get(k)
+            if v is None:
+                continue
+            try:
+                qty = float(str(v))
+                break
+            except (TypeError, ValueError):
+                continue
+        if abs(qty) >= 1 and tick not in known:
+            logger.error(f"RECONCILE: exchange holds {qty:+.0f} on {tick} "
+                         f"— ledger has no such position. raw={r!r}")
+            await notify(
+                f"⚠️ RECONCILE: exchange shows {qty:+.0f} contracts on\n"
+                f"{tick}\nthat the ledger doesn't know. It settles on "
+                f"Kalshi but won't appear in bot P&L.")
+
+
 async def poll_live_maker_fills():
+    if not PAPER_MODE and client:
+        await _reconcile_exchange_once()
     if PAPER_MODE or not pending_makers:
         return
     try:
@@ -396,10 +494,19 @@ async def poll_live_maker_fills():
         rows = by_order.get(intent["order_id"], [])
         for fid, f in rows:
             consumed_fill_ids.add(fid)
-            cnt = int(f.get("count", 0))
-            yes_p = int(f.get("yes_price", 0))
+            cnt = _fill_count_of(f)
+            yes_d = _fill_yes_dollars(f)
+            if cnt <= 0 or not (0.0 < yes_d < 1.0):
+                logger.error(f"UNPARSEABLE FILL — refusing to book. "
+                             f"raw={f!r}")
+                await notify(
+                    "⚠️ Maker fill arrived in an unknown shape — NOT "
+                    "booked. Check the log raw=… line and Kalshi "
+                    "portfolio: the fill is real on the exchange but "
+                    "absent from the ledger.")
+                continue
             side = intent["side"]
-            avg_d = (yes_p if side == "yes" else 100 - yes_p) / 100.0
+            avg_d = yes_d if side == "yes" else 1.0 - yes_d
             fee = maker_fee(avg_d, cnt)
             store.incr("maker_filled_contracts", cnt)
             meta: MarketMeta = intent["meta"]
@@ -407,8 +514,8 @@ async def poll_live_maker_fills():
                                 intent["p_model"])
             await announce_entry(pos, "MAKER fill")
             intent["filled"] += cnt
-        if intent["filled"] >= intent["count"]:
-            pending_makers.pop(key, None)
+            if intent["filled"] >= intent["count"]:
+                pending_makers.pop(key, None)
 
 
 async def purge_expired_makers():
