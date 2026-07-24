@@ -1100,6 +1100,13 @@ async def cmd_arblog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         arb.txt_log() if arb else "Arb scanner not started yet.")
 
 
+
+async def cmd_ladder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER:
+        return
+    await update.message.reply_text(
+        arb.txt_ladder() if arb else "Arb scanner not started yet.")
+
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER:
         return
@@ -1227,6 +1234,7 @@ async def on_startup(app: Application):
     arb_db = os.path.join(os.path.dirname(DB_PATH) or "/tmp", "arb.db")
     arb = ArbScanner(arb_db, lambda: http, notify)
     asyncio.create_task(arb.universe_loop())
+    asyncio.create_task(arb.ladder_loop())
     asyncio.create_task(arb.books_loop())
 
     await notify(
@@ -1257,6 +1265,7 @@ def main():
     app.add_handler(CommandHandler("arb", cmd_arb))
     app.add_handler(CommandHandler("arbpairs", cmd_arbpairs))
     app.add_handler(CommandHandler("arblog", cmd_arblog))
+    app.add_handler(CommandHandler("ladder", cmd_ladder))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_tg_error)
     app.post_init = on_startup
