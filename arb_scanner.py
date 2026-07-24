@@ -57,6 +57,15 @@ UNIVERSE_INTERVAL = float(os.getenv("ARB_UNIVERSE_INTERVAL", "900"))
 ALERT_COOLDOWN = float(os.getenv("ARB_ALERT_COOLDOWN", "1800"))
 MAX_PENDING = 40
 
+# ── intra-Kalshi ladder locks (same exchange, same rulebook, no oracle risk) ──
+LADDER_SERIES = [s.strip() for s in os.getenv(
+    "LADDER_SERIES", "KXBTCD,KXETHD,KXSOLD").split(",") if s.strip()]
+LADDER_MIN_EDGE = float(os.getenv("LADDER_MIN_EDGE", "0.010"))   # log ≥1%
+LADDER_ALERT_EDGE = float(os.getenv("LADDER_ALERT_EDGE", "0.020"))  # ping ≥2%
+LADDER_MIN_SIZE = float(os.getenv("LADDER_MIN_SIZE", "10"))
+LADDER_MAX = float(os.getenv("LADDER_MAX_PAIR", "200"))
+LADDER_INTERVAL = float(os.getenv("LADDER_INTERVAL", "30"))
+
 # series-scoped fetch knobs
 SERIES_TTL = float(os.getenv("ARB_SERIES_TTL", "43200"))   # census cache 12h
 MAX_SERIES = int(os.getenv("ARB_MAX_SERIES", "400"))       # shelf size cap
@@ -399,6 +408,10 @@ class ArbScanner:
         CREATE TABLE IF NOT EXISTS sightings(
             id INTEGER PRIMARY KEY, ts REAL, pair_id INTEGER,
             direction TEXT, k_price REAL, pm_price REAL,
+            size REAL, edge REAL, profit REAL, alerted INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS ladder_sightings(
+            id INTEGER PRIMARY KEY, ts REAL, series TEXT,
+            lo_ticker TEXT, hi_ticker TEXT, lo_ask REAL, hi_no_ask REAL,
             size REAL, edge REAL, profit REAL, alerted INTEGER DEFAULT 0);
         """)
         self.db.commit()
@@ -810,6 +823,119 @@ class ArbScanner:
                 (now, p["id"], direction, k_px, pmb["ask"], size, edge,
                  profit, alerted))
             self.db.commit()
+
+    # ── intra-Kalshi ladder lock watcher (READ-ONLY) ───────────────────
+    @staticmethod
+    def _strike_of(ticker: str):
+        """The numeric strike at the tail of a KX*D ticker, e.g.
+        KXBTCD-26JUL2412-T74799.99 → 74799.99."""
+        import re as _re
+        m = _re.search(r"-T(\d+(?:\.\d+)?)$", ticker or "")
+        return float(m.group(1)) if m else None
+
+    async def _ladder_markets(self, series: str):
+        """Open markets in one ladder series, sorted by ascending strike."""
+        data = await self._kget("/markets",
+                                {"status": "open", "limit": 1000,
+                                 "series_ticker": series},
+                                {"req": 0, "cap": 50, "exhausted": False})
+        rows = []
+        for m in (data or {}).get("markets", []) or []:
+            k = self._strike_of(m.get("ticker", ""))
+            if k is not None:
+                rows.append((k, m.get("ticker")))
+        rows.sort(key=lambda x: x[0])
+        return rows
+
+    async def ladder_loop(self):
+        await asyncio.sleep(45)
+        while True:
+            try:
+                for series in LADDER_SERIES:
+                    await self._scan_ladder(series)
+            except Exception as e:
+                logger.error(f"ladder scan: {e}", exc_info=True)
+            await asyncio.sleep(LADDER_INTERVAL)
+
+    async def _scan_ladder(self, series: str):
+        rungs = await self._ladder_markets(series)
+        if len(rungs) < 2:
+            return
+        # Pull each rung's book once.
+        books = {}
+        for _, tick in rungs:
+            raw = await self._kalshi_orderbook(tick)
+            kb = parse_kalshi_book(raw) if raw else None
+            if kb:
+                books[tick] = kb
+        now = time.time()
+        # For every lower/higher strike pair: P(lower) must be >= P(higher).
+        # Lock = buy YES(lower) + buy NO(higher). If both settle YES, or both
+        # NO, or lower-YES/higher-NO, you hold a guaranteed $1.00 on exactly
+        # one leg. Cost = lower_yes_ask + higher_no_ask; profit if < $1 net.
+        for i in range(len(rungs)):
+            lo_strike, lo_tick = rungs[i]
+            lb = books.get(lo_tick)
+            if not lb:
+                continue
+            for j in range(i + 1, len(rungs)):
+                hi_strike, hi_tick = rungs[j]
+                hb = books.get(hi_tick)
+                if not hb:
+                    continue
+                lo_yes = lb["yes_ask"]           # buy YES on lower strike
+                hi_no = hb["no_ask"]             # buy NO on higher strike
+                if lo_yes <= 0 or hi_no <= 0:
+                    continue
+                size = min(lb["yes_ask_sz"], hb["no_ask_sz"], LADDER_MAX)
+                if size < LADDER_MIN_SIZE:
+                    continue
+                gross = 1.0 - (lo_yes + hi_no)
+                fee = (kalshi_taker_fee(lo_yes, int(size))
+                       + kalshi_taker_fee(hi_no, int(size)))
+                profit = gross * size - fee
+                edge = profit / size if size else 0.0
+                if edge < LADDER_MIN_EDGE:
+                    continue
+                alerted = 0
+                if edge >= LADDER_ALERT_EDGE:
+                    alerted = 1
+                    await self.notify(
+                        f"🪜 LADDER LOCK {edge:.1%} — {series}\n"
+                        f"buy YES {lo_tick} @{lo_yes:.2f}\n"
+                        f"buy NO  {hi_tick} @{hi_no:.2f}\n"
+                        f"combined {lo_yes + hi_no:.3f} < $1.00 → "
+                        f"${profit:.2f} locked ×{size:.0f} "
+                        f"(same exchange, fee-adj, READ-ONLY)")
+                self.db.execute(
+                    "INSERT INTO ladder_sightings(ts,series,lo_ticker,"
+                    "hi_ticker,lo_ask,hi_no_ask,size,edge,profit,alerted) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now, series, lo_tick, hi_tick, lo_yes, hi_no, size,
+                     edge, profit, alerted))
+                self.db.commit()
+
+    def txt_ladder(self, limit: int = 10) -> str:
+        day = time.time() - 86400
+        s = self.db.execute(
+            "SELECT COUNT(*) n, MAX(edge) best, SUM(profit) tot "
+            "FROM ladder_sightings WHERE ts>?", (day,)).fetchone()
+        rows = self.db.execute(
+            "SELECT * FROM ladder_sightings ORDER BY ts DESC LIMIT ?",
+            (limit,)).fetchall()
+        out = ["🪜 Ladder locks [read-only, same-exchange]", "━━━━━━━━━━━━",
+               f"24h: {s['n'] or 0} sightings "
+               f"(best {(s['best'] or 0):.1%}, sum ${(s['tot'] or 0):.2f})"]
+        if not rows:
+            out.append("None yet. This is the SAFE arb — both legs settle on "
+                       "Kalshi by the same rules, so no oracle mismatch. "
+                       "Locks are rare; the watcher is patient.")
+        else:
+            for r in rows:
+                ago = (time.time() - r["ts"]) / 3600
+                out.append(f"{r['edge']:.1%} ×{r['size']:.0f} "
+                           f"(${r['profit']:.2f}) {ago:.1f}h ago  {r['series']}")
+        return "\n".join(out)
 
     # ── telegram surfaces ───────────────────────────────────────────────
     def approve(self, pid: int) -> bool:
