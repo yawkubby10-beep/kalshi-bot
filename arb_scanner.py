@@ -72,6 +72,15 @@ FALLBACK_CATEGORIES = [
 # lock heartland: always fetched, no PM-token gate needed
 CORE_CATEGORIES = ("econom", "politic", "financ", "world", "compan",
                    "climate", "weather", "science", "health")
+# Heartland seeds: lock-territory vocabulary that must never slip the
+# token net on phrasing (FOMC vs Fed, etc). Unioned with live PM tokens.
+HEARTLAND_TOKENS = frozenset((
+    "fed", "fomc", "rate", "rates", "cpi", "inflation", "gdp", "jobs",
+    "unemployment", "payrolls", "recession", "tariff", "tariffs",
+    "shutdown", "election", "president", "presidential", "senate",
+    "congress", "governor", "nominee", "impeachment", "war", "ceasefire",
+    "nato", "ukraine", "israel", "iran", "gaza", "taiwan", "oscars",
+    "grammys", "emmys", "nobel"))
 
 STOP_WORDS = {"will", "the", "be", "in", "on", "at", "of", "a", "an", "to",
               "by", "for", "or", "and", "vs", "market", "before", "after",
@@ -509,7 +518,7 @@ class ArbScanner:
         series: List[dict] = []
         for cat in cats[:24]:
             cursor = None
-            for _ in range(3):
+            for _ in range(8):
                 params = {"category": cat, "limit": 1000}
                 if cursor:
                     params["cursor"] = cursor
@@ -530,6 +539,9 @@ class ArbScanner:
                 cursor = data.get("cursor")
                 if not cursor:
                     break
+            if cursor:
+                logger.warning(f"arb census: category {cat} truncated at "
+                               f"page cap — series list incomplete")
         if series:
             seen, uniq = set(), []
             for srow in series:
@@ -547,32 +559,34 @@ class ArbScanner:
 
     def _select_series(self, all_series: List[dict],
                        pm_tokens: frozenset) -> List[dict]:
-        """The shelf: lock-heartland categories always; everything else
-        only if it shares real tokens with the live PM universe. Crypto
-        price/level series never (oracle-mismatch doctrine)."""
-        core, gated = [], []
+        """Every series earns its fetch via token overlap with the live
+        PM universe (+ heartland seeds). Categories no longer grant a
+        free pass — 'core' matched 9,926 series (city-weather explosion)
+        and starved the shelf to 400 thermometers with 0 pm-matched.
+        Overlap ranks; core category only breaks ties."""
+        gate = pm_tokens | HEARTLAND_TOKENS
+        scored = []
         for srow in all_series:
             blob = f"{srow['title']} {srow['tags']} {srow['ticker']}"
             if is_crypto_price_series(blob):
                 continue
-            cat = (srow["category"] or "").lower()
-            if any(c in cat for c in CORE_CATEGORIES):
-                core.append(srow)
+            overlap = len(tokens_of(blob) & gate)
+            if overlap < 1:
                 continue
-            overlap = tokens_of(blob) & pm_tokens
-            if overlap:
-                gated.append((len(overlap), srow))
-        gated.sort(key=lambda x: -x[0])
-        picked = core + [srow for _, srow in gated]
-        if len(picked) > MAX_SERIES:
-            logger.warning(f"arb shelf capped at {MAX_SERIES} of "
-                           f"{len(picked)} selected series")
-            picked = picked[:MAX_SERIES]
-        n_core = min(len(core), len(picked))
+            cat = (srow["category"] or "").lower()
+            core = 1 if any(c in cat for c in CORE_CATEGORIES) else 0
+            scored.append((overlap, core, srow))
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        picked = [s for _, _, s in scored[:MAX_SERIES]]
+        n_core = sum(c for _, c, _ in scored[:MAX_SERIES])
+        if len(scored) > MAX_SERIES:
+            logger.info(f"arb shelf: {len(scored)} passed the token gate; "
+                        f"keeping top {MAX_SERIES} by overlap")
         logger.info(f"arb kalshi shelf: {len(picked)}/{len(all_series)} "
-                    f"series selected ({n_core} core + "
-                    f"{max(0, len(picked) - n_core)} pm-matched)")
+                    f"series selected ({n_core} core-category, "
+                    f"{len(picked) - n_core} other)")
         return picked
+
 
     async def _kalshi_universe(self, pm_tokens: frozenset) -> List[dict]:
         """Series-scoped fetch. The flat alphabetical walk of /markets
